@@ -1,0 +1,13 @@
+属性名称                             说明                                                                  
+BOT_TOKEN                      对应机器人TOKEN（从 @BotFather 获取）                                   
+
+ADMIN_USER_IDS                对应管理员 Telegram 用户 ID（多个用英文逗号分隔）示例123456789,987654321
+
+PUBLISH_CHANNEL_ID       对应主发布频道 ID（带 -100 前缀的数字 ID）           示例 -1001234567890
+
+BOT_USERNAME_URL         对应机器人的 t.me 链接（用于生成直连、回复等按钮） 示例 https://t.me/YourBotName_bot
+
+FIREBASE_DB_URL              对应 Firebase 数据库 URL     
+FIREBASE_SECRET               对应Firebase 数据库密钥（Legacy Token，用于服务端认证）你的数据库密钥
+
+WEBAPP_URL                     对应 部署后填入的 Web App URL（非常重要！）    
