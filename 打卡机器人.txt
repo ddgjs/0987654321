@@ -725,7 +725,34 @@ function handleChannelPost(post) {
     // 彻底解决因快速连续发帖或多图相册，导致多个线程并发执行时均读取到 null，
     // 从而绕过您的去重逻辑，导致“发两个相同的老师进频道”的穿透 Bug！
     const lock = LockService.getScriptLock();
-    try { lock.waitLock(8000); } catch (e) { return; } // 等待最高8秒，防堵塞
+    // 🟢 修复：锁超时不再静默丢帖！旧逻辑 catch 后直接 return，
+    // 连续发帖/相册并发时后发的老师资料会被彻底漏收录，表现为「前面能收录后面不行」。
+    let lockAcquired = false;
+    try {
+      lock.waitLock(15000); // 适当拉长等待，给上一条重命名/删帖留时间
+      lockAcquired = true;
+    } catch (e) {
+      // 拿不到锁：写入重试队列，由定时任务补收录，绝不直接丢弃
+      try {
+        const retryId = `ch_idx_${post.message_id}_${new Date().getTime()}`;
+        writeToFirebase(`channel_index_retry/${retryId}`, {
+          chat_id: String(post.chat.id),
+          message_id: Number(post.message_id),
+          media_group_id: post.media_group_id || null,
+          text: post.text || post.caption || "",
+          has_photo: !!(post.photo && post.photo.length),
+          has_video: !!post.video,
+          has_document: !!post.document,
+          photo_file_id: (post.photo && post.photo.length) ? post.photo[post.photo.length - 1].file_id : null,
+          video_file_id: post.video ? post.video.file_id : null,
+          document_file_id: post.document ? post.document.file_id : null,
+          caption_entities: post.caption_entities || post.entities || null,
+          created_at: new Date().getTime()
+        });
+      } catch (qe) {}
+      console.error("handleChannelPost 锁超时，已入重试队列 message_id=" + post.message_id);
+      return;
+    }
 
     try {
       // 保留全局拉取用于底部的“剔除改名幽灵数据”循环，但比对逻辑强制改为实时动态读取
@@ -742,6 +769,12 @@ function handleChannelPost(post) {
         
         let richText = typeof parseTelegramHtml === 'function' ? parseTelegramHtml(post) : text;
         let cleanText = richText.replace(/📊[\s\S]*?【全维度评分】[\s\S]*?-------------------\n?/g, '').trim();
+        // 🟢 修复：额外保留去标签纯文本，供分类标签（如「大朗」）稳定匹配。
+        // 仅靠 original_text（HTML）时，实体转义/加粗嵌套会导致 includes 漏匹。
+        let plainSearchText = String(text || "")
+          .replace(/📊[\s\S]*?【全维度评分】[\s\S]*?-------------------\n?/g, '')
+          .replace(/<[^>]+>/g, '')
+          .trim();
 
         let idMatch = text.match(/(?:【?编号】?)[：:\s]+([a-zA-Z0-9\-_]+)/) || text.match(/编号[：:\s]*([a-zA-Z0-9\-_]+)/);
         let teacherCode = idMatch ? idMatch[1].trim() : null;
@@ -866,6 +899,13 @@ function handleChannelPost(post) {
                 // 暴力兜底：直接将全文所有出现的该旧名字强制替换为新带数字的名字
                 cleanText = cleanText.replace(new RegExp(safeOriginalName, 'g'), teacherName);
             }
+
+            // 🟢 名字顺延后，同步刷新可搜索纯文本（必须紧跟 cleanText 替换之后）
+            // 否则 search_text 仍是旧名「苍老师」，标签匹配/搜索会对不上「苍老师2」
+            plainSearchText = String(cleanText || "")
+              .replace(/<[^>]+>/g, '')
+              .replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&amp;/g, '&')
+              .trim();
           }
         } else {
           // 库里完全没有这个名字，或者是纯新人首发
@@ -917,6 +957,7 @@ function handleChannelPost(post) {
               channel_id: String(post.chat.id), 
               channel_tier: "",
               original_text: cleanText,  
+              search_text: plainSearchText,
               has_media: hasMedia,      
               teacher_code: teacherCode || existingData.teacher_code || "", 
               tg_id: existingData.tg_id || null,
@@ -957,7 +998,8 @@ function handleChannelPost(post) {
                          media_group_id: null,
                          channel_id: String(post.chat.id), 
                          channel_tier: "",
-                         original_text: cleanText,  
+                         original_text: cleanText,
+                         search_text: plainSearchText,  // 🟢 必须带上，与未改名分支一致
                          has_media: hasMedia,      
                          teacher_code: teacherCode || "", 
                          tg_id: existingData.tg_id || null,
@@ -975,7 +1017,9 @@ function handleChannelPost(post) {
       }
     });
     } finally {
-      lock.releaseLock(); // 🟢 释放并发锁，允许下一个帖子处理
+      if (lockAcquired) {
+        try { lock.releaseLock(); } catch (e) {}
+      }
     }
   }
 }
@@ -8028,7 +8072,11 @@ function sendOpenClassList(chatId, userId, messageId, page, replyToMsgId) {
     //   ② 老师资料帖已发到频道(有 message_id)、管理员也设为🟢在岗，但这位老师还没被单独绑定过 TG 账号(没有 tg_id/username)。
     // 现在只要 status=online，且 message_id / tg_id / username 三者任意一个存在（说明这是一条真实老师记录），就先纳入在线名单；
     // 具体"点击后跳资料页还是跳直连老师"，交给下面渲染按钮时按 message_id 是否存在来判断，不再影响是否显示。
-    if (okAllTeachers[name].status === 'online' && (okAllTeachers[name].message_id || okAllTeachers[name].tg_id || okAllTeachers[name].username)) {
+    // 🟢 修复：收录成功（有 message_id）的在岗老师必显示；
+    // 无 status 但有资料帖的，不再因从未打卡被整表滤掉（可选：仅 online）
+    const st = okAllTeachers[name].status;
+    const hasProfile = !!(okAllTeachers[name].message_id || okAllTeachers[name].tg_id || okAllTeachers[name].username);
+    if (st === 'online' && hasProfile) {
       okOnlineList.push({
         name: name,
         message_id: okAllTeachers[name].message_id || null,
@@ -8881,13 +8929,17 @@ function sendTeacherStatusBoard(chatId, tagIndex, page, messageId, replyToMsgId)
         // 频道帖子已删除（message_id 为空）的老师直接从列表剔除，不显示任何按钮
         if (!allTeachers[name].message_id) return false;
         
-        // 提取频道自动收录时的原文案并统一转为小写，防止英文字母大小写差异导致漏匹
-        const original = String(allTeachers[name].original_text || "").toLowerCase();
+        // 🟢 修复：优先用 search_text（纯文本）；否则把 original_text 去 HTML 再匹配。
+        // 解决「地址标签：大朗」等关键词因 HTML/转义导致 includes 失败、列表缺人的问题。
+        const rawSearch = String(
+          allTeachers[name].search_text ||
+          String(allTeachers[name].original_text || "").replace(/<[^>]+>/g, '')
+        ).toLowerCase();
         const tName = String(name).toLowerCase();
-        const searchTag = String(tagName).toLowerCase();
+        const searchTag = String(tagName).toLowerCase().trim();
+        if (!searchTag) return false;
         
-        // 只要原文案或老师名字里包含了这个词，就判定为命中该搜索
-        return original.includes(searchTag) || tName.includes(searchTag);
+        return rawSearch.includes(searchTag) || tName.includes(searchTag);
       })
     .map(name => ({
       name: name,
@@ -9375,6 +9427,7 @@ function cleanupDeletedTeachers() {
     processScheduledLeaderboards();
   try { processScheduledStatusTasks(); } catch (e) {}
   try { processAutoDeleteQueue(); } catch (e) {}
+  try { processChannelIndexRetry(); } catch (e) {}
 
   // 🟢 核心修复：双保险执行关键词自动删除队列（即使专用触发器异常，也能在这里兜底清理）
   try { processAutoDeleteQueue(); } catch(e) {}
@@ -10836,6 +10889,55 @@ function processAutoDeleteQueue() {
       // 从数据库队列中彻底移除该任务，防止重复处理
       writeToFirebase(`delete_queue/${key}`, null);
     }
+  }
+}
+// 🟢 频道收录锁超时重试：把漏掉的 channel_post 补写进 teachers
+function processChannelIndexRetry() {
+  const queue = readFromFirebase('channel_index_retry');
+  if (!queue) return;
+
+  const lock = LockService.getScriptLock();
+  let got = false;
+  try {
+    got = lock.tryLock(2000);
+  } catch (e) { return; }
+  if (!got) return;
+
+  try {
+    initGlobalConfig();
+    const now = new Date().getTime();
+    for (let id in queue) {
+      const item = queue[id];
+      if (!item || !item.message_id) {
+        writeToFirebase(`channel_index_retry/${id}`, null);
+        continue;
+      }
+      // 超过 30 分钟仍失败则丢弃，避免死队列
+      if (item.created_at && now - item.created_at > 30 * 60 * 1000) {
+        writeToFirebase(`channel_index_retry/${id}`, null);
+        continue;
+      }
+      // 构造成最小 post 对象，复用 handleChannelPost
+      const fakePost = {
+        chat: { id: item.chat_id },
+        message_id: item.message_id,
+        media_group_id: item.media_group_id || null,
+        text: item.text || "",
+        caption: item.text || "",
+        photo: item.photo_file_id ? [{ file_id: item.photo_file_id }] : null,
+        video: item.video_file_id ? { file_id: item.video_file_id } : null,
+        document: item.document_file_id ? { file_id: item.document_file_id } : null
+      };
+      try {
+        handleChannelPost(fakePost);
+        writeToFirebase(`channel_index_retry/${id}`, null);
+      } catch (err) {
+        console.error("processChannelIndexRetry:", err);
+      }
+      Utilities.sleep(500);
+    }
+  } finally {
+    try { lock.releaseLock(); } catch (e) {}
   }
 }
 // ================= 🛡️ 防垃圾模块（可扩展） =================
