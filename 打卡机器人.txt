@@ -697,7 +697,8 @@ function doPost(e) {
 }
 
 // ================= 处理频道消息 (自动索引老师资料) =================
-function handleChannelPost(post) {
+// skipLock=true：由 processChannelIndexRetry 等已持锁调用方传入，避免 ScriptLock 不可重入导致补收录永远失败
+function handleChannelPost(post, skipLock) {
   const text = post.text || post.caption || "";
 
   // 🟢 确保只收录系统指定频道的发布
@@ -719,39 +720,36 @@ function handleChannelPost(post) {
   // 提取文本中所有的 【老师】：标签 (例如 【老师】：苍老师)
   // 🟢 终极修复：正则兼容中英冒号，允许前后空格 \s*，甚至兼容管理员粗心漏打冒号的情况！
   // 彻底解决“【老师】 : 苍老师”或“【老师】苍老师”导致没动静的漏发 Bug！
-  const hashtags = text.match(/【老师】\s*[:：]?\s*([^\s,，。、！!？?\n]+)/g);
+const hashtags = text.match(/【老师】\s*[:：]?\s*([^\s,，。、！!？?\n]+)/g);
   if (hashtags) {
-    // 🟢 终极并发修复：引入 GAS 原生防重锁 (ScriptLock)！
-    // 彻底解决因快速连续发帖或多图相册，导致多个线程并发执行时均读取到 null，
-    // 从而绕过您的去重逻辑，导致“发两个相同的老师进频道”的穿透 Bug！
     const lock = LockService.getScriptLock();
-    // 🟢 修复：锁超时不再静默丢帖！旧逻辑 catch 后直接 return，
-    // 连续发帖/相册并发时后发的老师资料会被彻底漏收录，表现为「前面能收录后面不行」。
     let lockAcquired = false;
-    try {
-      lock.waitLock(15000); // 适当拉长等待，给上一条重命名/删帖留时间
-      lockAcquired = true;
-    } catch (e) {
-      // 拿不到锁：写入重试队列，由定时任务补收录，绝不直接丢弃
+    if (!skipLock) {
       try {
-        const retryId = `ch_idx_${post.message_id}_${new Date().getTime()}`;
-        writeToFirebase(`channel_index_retry/${retryId}`, {
-          chat_id: String(post.chat.id),
-          message_id: Number(post.message_id),
-          media_group_id: post.media_group_id || null,
-          text: post.text || post.caption || "",
-          has_photo: !!(post.photo && post.photo.length),
-          has_video: !!post.video,
-          has_document: !!post.document,
-          photo_file_id: (post.photo && post.photo.length) ? post.photo[post.photo.length - 1].file_id : null,
-          video_file_id: post.video ? post.video.file_id : null,
-          document_file_id: post.document ? post.document.file_id : null,
-          caption_entities: post.caption_entities || post.entities || null,
-          created_at: new Date().getTime()
-        });
-      } catch (qe) {}
-      console.error("handleChannelPost 锁超时，已入重试队列 message_id=" + post.message_id);
-      return;
+        lock.waitLock(15000);
+        lockAcquired = true;
+      } catch (e) {
+        // 拿不到锁：写入重试队列，由定时任务补收录，绝不直接丢弃
+        try {
+          const retryId = `ch_idx_${post.message_id}_${new Date().getTime()}`;
+          writeToFirebase(`channel_index_retry/${retryId}`, {
+            chat_id: String(post.chat.id),
+            message_id: Number(post.message_id),
+            media_group_id: post.media_group_id || null,
+            text: post.text || post.caption || "",
+            has_photo: !!(post.photo && post.photo.length),
+            has_video: !!post.video,
+            has_document: !!post.document,
+            photo_file_id: (post.photo && post.photo.length) ? post.photo[post.photo.length - 1].file_id : null,
+            video_file_id: post.video ? post.video.file_id : null,
+            document_file_id: post.document ? post.document.file_id : null,
+            caption_entities: post.caption_entities || post.entities || null,
+            created_at: new Date().getTime()
+          });
+        } catch (qe) {}
+        console.error("handleChannelPost 锁超时，已入重试队列 message_id=" + post.message_id);
+        return;
+      }
     }
 
     try {
@@ -771,9 +769,11 @@ function handleChannelPost(post) {
         let cleanText = richText.replace(/📊[\s\S]*?【全维度评分】[\s\S]*?-------------------\n?/g, '').trim();
         // 🟢 修复：额外保留去标签纯文本，供分类标签（如「大朗」）稳定匹配。
         // 仅靠 original_text（HTML）时，实体转义/加粗嵌套会导致 includes 漏匹。
+        // 纯文本供分类标签匹配（如「南城」）；去掉评分板 + HTML，并还原实体，避免 includes 漏匹
         let plainSearchText = String(text || "")
           .replace(/📊[\s\S]*?【全维度评分】[\s\S]*?-------------------\n?/g, '')
           .replace(/<[^>]+>/g, '')
+          .replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&amp;/g, '&').replace(/&quot;/g, '"')
           .trim();
 
         let idMatch = text.match(/(?:【?编号】?)[：:\s]+([a-zA-Z0-9\-_]+)/) || text.match(/编号[：:\s]*([a-zA-Z0-9\-_]+)/);
@@ -903,9 +903,9 @@ function handleChannelPost(post) {
             // 🟢 名字顺延后，同步刷新可搜索纯文本（必须紧跟 cleanText 替换之后）
             // 否则 search_text 仍是旧名「苍老师」，标签匹配/搜索会对不上「苍老师2」
             plainSearchText = String(cleanText || "")
-              .replace(/<[^>]+>/g, '')
-              .replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&amp;/g, '&')
-              .trim();
+           .replace(/<[^>]+>/g, '')
+           .replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&amp;/g, '&').replace(/&quot;/g, '"')
+           .trim();
           }
         } else {
           // 库里完全没有这个名字，或者是纯新人首发
@@ -9415,22 +9415,18 @@ function checkAndDowngradeTeacherTiers() {
 }
 
 function cleanupDeletedTeachers() {
-  // 🟢 核心修复：满足系统的 2 分钟缓冲执行要求。
-  // 利用时间戳拦截，当前分钟数为奇数时直接退出，完美实现 2 分钟精准执行周期
-  if (new Date().getMinutes() % 2 !== 0) return;
+  // 🟢 改为每 5 分钟执行一次（大幅降低 UrlFetch 消耗）
+  // 用分钟数取模，0/5/10/15... 才继续
+  if (new Date().getMinutes() % 5 !== 0) return;
 
   // 🟢 加载动态配置（频道 ID 等）
   initGlobalConfig();
 
-    // 🟢 核心修复 1：将榜单发布队列前置！
-  // 避免当系统中没有任何老师资料时，下方的 return 阻断了队列运行，导致定时榜单功能彻底瘫痪
-    processScheduledLeaderboards();
+  // 前置处理队列（只保留一次 processAutoDeleteQueue）
+  try { processScheduledLeaderboards(); } catch (e) {}
   try { processScheduledStatusTasks(); } catch (e) {}
   try { processAutoDeleteQueue(); } catch (e) {}
   try { processChannelIndexRetry(); } catch (e) {}
-
-  // 🟢 核心修复：双保险执行关键词自动删除队列（即使专用触发器异常，也能在这里兜底清理）
-  try { processAutoDeleteQueue(); } catch(e) {}
 
   const allTeachers = readFromFirebase('teachers') || {};
 
@@ -9688,20 +9684,68 @@ function parseCustomTime(timeStr) {
 
 // 🟢 新增：老师打卡状态变动时，遍历所有关注该老师的用户并私信推送通知
 function notifyTeacherFollowers(teacherName, statusText) {
-  const allProfiles = readFromFirebase('user_profiles');
-  if (!allProfiles) return;
+  // 🟢 短缓存，避免同一分钟内多次全表扫描 user_profiles
+  const cache = CacheService.getScriptCache();
+  const cacheKey = 'all_user_profiles_snap';
+  let allProfiles = null;
+  const cached = cache.get(cacheKey);
+  if (cached) {
+    try { allProfiles = JSON.parse(cached); } catch (e) {}
+  }
+  if (!allProfiles) {
+    allProfiles = readFromFirebase('user_profiles') || {};
+    // 只缓存 60 秒，既省配额又保证关注关系相对新鲜
+    try {
+      cache.put(cacheKey, JSON.stringify(allProfiles), 60);
+    } catch (e) { /* 超大对象可能放不进 Cache，忽略 */ }
+  }
+  if (!allProfiles || Object.keys(allProfiles).length === 0) return;
+
   const channelNumericId = String(PUBLISH_CHANNEL_ID).replace(/^-100/, '');
   const td = readFromFirebase(`teachers/${teacherName}`) || {};
   const profileUrl = td.message_id ? `https://t.me/c/${channelNumericId}/${td.message_id}` : null;
 
+  const notifyText = `🔔 <b>关注动态提醒</b>\n\n您关注的老师 <b>${escapeHtml(teacherName)}</b> 刚刚更新了状态：\n${statusText}\n\n点击下方按钮查看资料详情 👇`;
+  const notifyKeyboard = profileUrl
+    ? { inline_keyboard: [[{ text: `📋 查看 ${teacherName} 资料`, url: profileUrl }]] }
+    : null;
+
+  // 收集需要通知的 uid
+  const targets = [];
   for (let uid in allProfiles) {
     const profile = allProfiles[uid];
-    if (profile.follows && profile.follows[teacherName]) {
-      const notifyText = `🔔 <b>关注动态提醒</b>\n\n您关注的老师 <b>${escapeHtml(teacherName)}</b> 刚刚更新了状态：\n${statusText}\n\n点击下方按钮查看资料详情 👇`;
-      const notifyKeyboard = profileUrl
-        ? { inline_keyboard: [[{ text: `📋 查看 ${teacherName} 资料`, url: profileUrl }]] }
-        : null;
-      try { sendMessage(uid, notifyText, notifyKeyboard, "HTML"); } catch (e) { /* 用户屏蔽机器人则静默忽略 */ }
+    if (profile && profile.follows && profile.follows[teacherName]) {
+      targets.push(uid);
+    }
+  }
+  if (targets.length === 0) return;
+
+  // 🟢 用 fetchAll 批量发送（每批最多 20，降低配额压力与 429 风险）
+  const BATCH = 20;
+  for (let i = 0; i < targets.length; i += BATCH) {
+    const batch = targets.slice(i, i + BATCH);
+    const requests = batch.map(uid => {
+      const payload = {
+        chat_id: uid,
+        text: notifyText,
+        parse_mode: "HTML"
+      };
+      if (notifyKeyboard) payload.reply_markup = notifyKeyboard;
+      return {
+        url: TG_API_URL + "sendMessage",
+        method: "post",
+        contentType: "application/json",
+        payload: JSON.stringify(payload),
+        muteHttpExceptions: true
+      };
+    });
+    try {
+      UrlFetchApp.fetchAll(requests);
+    } catch (e) {
+      // 单批失败不影响后续
+    }
+    if (i + BATCH < targets.length) {
+      Utilities.sleep(300); // 批次间轻微间隔
     }
   }
 }
@@ -10163,7 +10207,7 @@ function setWebhook() {
     
     if (!isTriggerExists) {
               // 🟢 修复：GAS API 不支持传 2。先设为基准 1 分钟，配合上方的奇数分钟拦截逻辑，实现完美 2 分钟周期
-              ScriptApp.newTrigger('cleanupDeletedTeachers').timeBased().everyMinutes(1).create();
+              ScriptApp.newTrigger('cleanupDeletedTeachers').timeBased().everyMinutes(5).create();
               Logger.log("✅ 成功自动注入：cleanupDeletedTeachers 定时触发器已同步创建 (基准1分钟)");
             }
         
@@ -10171,13 +10215,13 @@ function setWebhook() {
         const triggersNow = ScriptApp.getProjectTriggers();
             // batchRecalcTeacherScores 已随车评系统移除，不再注入
 
-    // 🟢 核心修复：自动注入关键词自动删除队列处理器（此前只有注释要求手动加触发器，导致时间到了从不删除）
-    const triggersFinal = ScriptApp.getProjectTriggers();
-    let delQueueExists = triggersFinal.some(t => t.getHandlerFunction() === 'processAutoDeleteQueue');
-    if (!delQueueExists) {
-      ScriptApp.newTrigger('processAutoDeleteQueue').timeBased().everyMinutes(1).create();
-      Logger.log("✅ 成功自动注入：processAutoDeleteQueue 定时触发器 (每1分钟)");
-    }
+// 🟢 核心修复：自动注入关键词自动删除队列处理器（此前只有注释要求手动加触发器，导致时间到了从不删除）
+const triggersFinal = ScriptApp.getProjectTriggers();
+let delQueueExists = triggersFinal.some(t => t.getHandlerFunction() === 'processAutoDeleteQueue');
+if (!delQueueExists) {
+  ScriptApp.newTrigger('processAutoDeleteQueue').timeBased().everyMinutes(2).create();
+  Logger.log("✅ 成功自动注入：processAutoDeleteQueue 定时触发器 (每2分钟)");
+}
   } catch (error) {
     Logger.log("❌ 自动注入触发器时发生异常: " + error.toString());
   }
@@ -10776,57 +10820,31 @@ function processScheduledStatusTasks() {
   const now = new Date().getTime();
   const statusMap = { online: "🟢 在岗", offline: "🔴 下班", leave: "🟡 休息" };
   let anyDone = false;
-  // 🟢 批量结束后只同步一次定时消息按钮 + 一次在岗榜，避免 N 个老师各自全表扫 / 刷 API
-  const changedNames = [];
+
+  // 收集：teacherName → 最终目标状态（同一老师多任务时以后面的为准）
+  const teacherStatusMap = {};   // { "苍老师": "online", ... }
+  const taskIdsToDelete = [];
+  const loopRewrite = {};        // id → nextPayload
+
+  // 一次拉取老师表
+  const allTeachersSnap = readFromFirebase('teachers') || {};
 
   for (let id in tasks) {
     const task = tasks[id];
     if (!task || !task.execute_at || now < task.execute_at) continue;
     if (!task.teacher_names || !task.target_status) {
-      writeToFirebase(`status_schedule_queue/${id}`, null);
+      taskIdsToDelete.push(id);
       continue;
     }
 
-    // 防并发：先摘掉任务节点
-    writeToFirebase(`status_schedule_queue/${id}`, null);
-
-    // 🟢 一次拉取全表，避免每位老师单独 readFromFirebase
-    const allTeachersSnap = readFromFirebase('teachers') || {};
+    taskIdsToDelete.push(id); // 先摘掉，防并发
 
     task.teacher_names.forEach(teacherName => {
-      try {
-        if (!allTeachersSnap[teacherName]) return;
-
-        updateFirebase(`teachers/${teacherName}`, {
-          status: task.target_status,
-          last_check_in: now
-        });
-
-        writeToFirebase(`checkin_logs/${teacherName}/${now}_${Math.floor(Math.random()*1000)}`, {
-          status: task.target_status,
-          status_text: statusMap[task.target_status],
-          operated_by: "schedule_auto",
-          timestamp: now,
-          time_string: new Date(now).toLocaleString("zh-CN", { timeZone: "Asia/Shanghai" })
-        });
-
-        changedNames.push(teacherName);
-        anyDone = true;
-      } catch (e) {
-        Logger.log("定时状态切换失败 " + teacherName + ": " + e);
-      }
+      if (!allTeachersSnap[teacherName]) return;
+      teacherStatusMap[teacherName] = task.target_status;
     });
 
-    // 🟢 关注通知：仍按人发，但加微延迟，降低 Telegram 429 风险
-    const stText = statusMap[task.target_status];
-    changedNames.forEach((teacherName, idx) => {
-      try {
-        if (idx > 0 && idx % 5 === 0) Utilities.sleep(300);
-        notifyTeacherFollowers(teacherName, stText);
-      } catch (e) {}
-    });
-
-    // 🔁 循环：执行完后预约下一次
+    // 循环任务：计算下一次执行时间
     if (task.loop) {
       let nextAt = null;
       if (task.schedule_type === "daily_at" && task.daily_hh != null && task.daily_mm != null) {
@@ -10837,17 +10855,73 @@ function processScheduledStatusTasks() {
         nextAt = now + Number(task.interval_ms);
       }
       if (nextAt) {
-        const nextPayload = Object.assign({}, task, {
+        loopRewrite[id] = Object.assign({}, task, {
           execute_at: nextAt,
           last_run_at: now
         });
-        writeToFirebase(`status_schedule_queue/${id}`, nextPayload);
       }
     }
   }
 
+  const changedNames = Object.keys(teacherStatusMap);
+  if (changedNames.length === 0) {
+    // 只清理无效任务
+    taskIdsToDelete.forEach(id => writeToFirebase(`status_schedule_queue/${id}`, null));
+    return;
+  }
+
+  // ========== 1. 批量写老师状态（一次 multi-path PATCH，大幅省 UrlFetch） ==========
+  const statusPatch = {};
+  changedNames.forEach(name => {
+    statusPatch[`teachers/${name}/status`] = teacherStatusMap[name];
+    statusPatch[`teachers/${name}/last_check_in`] = now;
+  });
+  // 用空 path 的 updateFirebase 实现多路径更新（你现有的 updateFirebase 支持）
+  try {
+    updateFirebase('', statusPatch);
+  } catch (e) {
+    // 兜底：逐个写
+    changedNames.forEach(name => {
+      updateFirebase(`teachers/${name}`, {
+        status: teacherStatusMap[name],
+        last_check_in: now
+      });
+    });
+  }
+
+  // ========== 2. 写打卡日志（仍逐条，但数量已可控） ==========
+  changedNames.forEach(name => {
+    const st = teacherStatusMap[name];
+    writeToFirebase(`checkin_logs/${name}/${now}_${Math.floor(Math.random() * 1000)}`, {
+      status: st,
+      status_text: statusMap[st],
+      operated_by: "schedule_auto",
+      timestamp: now,
+      time_string: new Date(now).toLocaleString("zh-CN", { timeZone: "Asia/Shanghai" })
+    });
+  });
+
+  // ========== 3. 清理已执行任务 + 写回循环任务 ==========
+  taskIdsToDelete.forEach(id => {
+    if (loopRewrite[id]) {
+      writeToFirebase(`status_schedule_queue/${id}`, loopRewrite[id]);
+    } else {
+      writeToFirebase(`status_schedule_queue/${id}`, null);
+    }
+  });
+
+  anyDone = true;
+
+  // ========== 4. 关注通知（每个老师只通知一次） ==========
+  changedNames.forEach((teacherName, idx) => {
+    try {
+      if (idx > 0 && idx % 3 === 0) Utilities.sleep(200); // 轻微限速
+      notifyTeacherFollowers(teacherName, statusMap[teacherStatusMap[teacherName]]);
+    } catch (e) {}
+  });
+
+  // ========== 5. 只同步一次 ==========
   if (anyDone) {
-    // 🟢 只调用一次：内部已按 STATUS 绑定刷新所有相关定时消息
     try { syncScheduledMessagesStatus(changedNames[0] || ""); } catch (e) {}
     try { refreshAllTeacherStatusBoards(); } catch (e) {}
   }
@@ -10899,8 +10973,13 @@ function processChannelIndexRetry() {
   const lock = LockService.getScriptLock();
   let got = false;
   try {
-    got = lock.tryLock(2000);
-  } catch (e) { return; }
+    // 与 handleChannelPost 一致用 waitLock，避免瞬时抢锁失败导致整批重试被跳过
+    lock.waitLock(15000);
+    got = true;
+  } catch (e) {
+    console.error("processChannelIndexRetry 获取锁超时，下周期再试");
+    return;
+  }
   if (!got) return;
 
   try {
@@ -10929,7 +11008,8 @@ function processChannelIndexRetry() {
         document: item.document_file_id ? { file_id: item.document_file_id } : null
       };
       try {
-        handleChannelPost(fakePost);
+        // 本函数已持有 ScriptLock，必须 skipLock，否则内层 waitLock 不可重入 → 补收录永远失败
+        handleChannelPost(fakePost, true);
         writeToFirebase(`channel_index_retry/${id}`, null);
       } catch (err) {
         console.error("processChannelIndexRetry:", err);
