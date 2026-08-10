@@ -8969,8 +8969,13 @@ function sendTeacherStatusBoard(chatId, tagIndex, page, messageId, replyToMsgId)
   const allTeachers = readFromFirebase('teachers') || {};
   const teacherList = Object.keys(allTeachers)
       .filter(name => {
-        // 频道帖子已删除（message_id 为空）的老师直接从列表剔除，不显示任何按钮
-        if (!allTeachers[name].message_id) return false;
+        // 🟢 核心修复：不再要求 message_id 存在才能进列表！
+        // 旧代码只要没有 message_id（还没发资料帖 / 帖子已被撤回）就整条剔除，
+        // 但老师打卡【在岗】走的按钮回调和群关键词两条路径，从来都不写 message_id，
+        // 管理员手动面板(ATSS.)代打卡同样不写 message_id —— 这些老师在【老师状态管理】
+        // 和【📚开课列表】里都能正常显示🟢在岗，唯独在这里被 message_id 判断误杀，
+        // 造成"明明打卡在岗了，群里标签搜索却查不到"的表现。
+        // 现在只用"是否匹配标签"决定是否收录；有没有资料帖只影响下面按钮跳去哪，不再影响是否显示。
         
         // 🟢 修复：优先用 search_text（纯文本）；否则把 original_text 去 HTML 再匹配。
         // 解决「地址标签：大朗」等关键词因 HTML/转义导致 includes 失败、列表缺人的问题。
@@ -8988,7 +8993,10 @@ function sendTeacherStatusBoard(chatId, tagIndex, page, messageId, replyToMsgId)
       name: name,
       status: allTeachers[name].status, // online / offline / leave / undefined(从未打卡)
       added_at: allTeachers[name].added_at || 0,
-      message_id: allTeachers[name].message_id,
+      message_id: allTeachers[name].message_id || null,
+      // 🟢 新增：没有资料帖时，用于下方按钮直连老师本人的兜底字段
+      tg_id: allTeachers[name].tg_id || null,
+      username: allTeachers[name].username || null,
       // 🟢 核心修复 1：提取该老师专属的真实所在频道 ID，而不是用全局默认 ID
       channel_id: allTeachers[name].channel_id || PUBLISH_CHANNEL_ID 
     }))
@@ -9045,7 +9053,11 @@ function sendTeacherStatusBoard(chatId, tagIndex, page, messageId, replyToMsgId)
       const chIdStr = String(t.channel_id || PUBLISH_CHANNEL_ID);
 
       let buttonUrl = "";
-      if (PUBLIC_CHANNEL_MAP[chIdStr]) {
+      // 🟢 核心修复：没有资料帖(message_id)时不再拼出 ".../undefined" 的坏链接，
+      // 改为跟【📚开课列表】一致的兜底逻辑——直连老师本人（有 username 优先，否则用 tg_id）
+      if (!t.message_id) {
+        buttonUrl = t.username ? `https://t.me/${t.username}` : (t.tg_id ? `tg://user?id=${t.tg_id}` : "");
+      } else if (PUBLIC_CHANNEL_MAP[chIdStr]) {
         // 公开频道：使用 https://t.me/用户名/消息ID 格式（未加群的用户也能直接查看）
         buttonUrl = `https://t.me/${PUBLIC_CHANNEL_MAP[chIdStr]}/${t.message_id}`;
       } else {
@@ -9053,6 +9065,10 @@ function sendTeacherStatusBoard(chatId, tagIndex, page, messageId, replyToMsgId)
         const targetChannelId = chIdStr.replace(/^-100/, '');
         buttonUrl = `https://t.me/c/${targetChannelId}/${t.message_id}`;
       }
+
+      // 🟢 极端兜底：资料帖、username、tg_id 三者都没有（仅靠名字匹配到标签）时没有可跳转链接，
+      // 跳过这一个按钮即可，不影响同一页其它老师正常显示
+      if (!buttonUrl) return;
 
             boardRow.push({ text: `${emoji} ${t.name}`, url: buttonUrl });
       if (boardRow.length === 2) {
