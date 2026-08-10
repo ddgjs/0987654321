@@ -1194,11 +1194,12 @@ function handleMessage(message) {
             if (resData.ok && resData.result) botMsgId = resData.result.message_id;
           } catch (e) {}
 
-          // 🟢 非阻塞：写入 delete_queue
+          // 🟢 非阻塞兜底：写入 delete_queue（触发器每 1 分钟扫一次，防止 webhook 提前结束导致漏删）
+          let checkinQueueId = null;
+          const expireAt = nowTs + 10 * 1000;
           if (botMsgId || message.message_id) {
-            const expireAt = nowTs + 10 * 1000;
-            const queueId = `checkin_del_${nowTs}_${Math.floor(Math.random() * 1000)}`;
-            writeToFirebase(`delete_queue/${queueId}`, {
+            checkinQueueId = `checkin_del_${nowTs}_${Math.floor(Math.random() * 1000)}`;
+            writeToFirebase(`delete_queue/${checkinQueueId}`, {
               chat_id: String(chatId),
               bot_msg_id: botMsgId || null,
               user_msg_id: message.message_id || null,
@@ -1210,6 +1211,35 @@ function handleMessage(message) {
           try { refreshAllTeacherStatusBoards(); } catch (e) {}
           try { syncScheduledMessagesStatus(teacherName); } catch (e) {}
           try { notifyTeacherFollowers(teacherName, statusMap[status]); } catch (e) {}
+
+          // 🟢 加速删除：重逻辑结束后，若已接近/超过 10 秒，立刻删提示+触发消息并出队
+          // 多数打卡请求会在这里真正完成“约 10 秒自毁”，队列仅作兜底
+          try {
+            const remain = expireAt - new Date().getTime();
+            // 剩余 1～12 秒时轻量等待，避免刷榜特别快时提示闪一下就没
+            if (remain > 1000 && remain <= 12000) {
+              Utilities.sleep(Math.min(remain, 8000));
+            }
+            if (message.message_id) {
+              try {
+                sendTelegramMessage("deleteMessage", {
+                  chat_id: String(chatId),
+                  message_id: Number(message.message_id)
+                });
+              } catch (e) {}
+            }
+            if (botMsgId) {
+              try {
+                sendTelegramMessage("deleteMessage", {
+                  chat_id: String(chatId),
+                  message_id: Number(botMsgId)
+                });
+              } catch (e) {}
+            }
+            if (checkinQueueId) {
+              try { writeToFirebase(`delete_queue/${checkinQueueId}`, null); } catch (e) {}
+            }
+          } catch (e) {}
                 } else {
           // 未绑定老师：轻提示，非阻塞约 10 秒后删
           try {
@@ -4663,10 +4693,18 @@ function handleCallbackQuery(callbackQuery) {
     const tasks = readFromFirebase('schedule_queue') || {};
     let taskList = [];
     for (let id in tasks) {
-      taskList.push({ id: id, ...tasks[id] });
+      const t = tasks[id];
+      if (!t || typeof t !== 'object') continue;
+      // 🟢 只展示真正的定时发布任务，过滤 WELDEL_ 等系统内部自毁节点
+      // 判定：ID 以 TASK_ 开头，或同时具备 status + sendTime（兼容历史数据）
+      const isRealLb =
+        String(id).startsWith('TASK_') ||
+        (t.status != null && t.sendTime != null);
+      if (!isRealLb) continue;
+      taskList.push({ id: id, ...t });
     }
-    // 按创建时间倒序排列（最新的排在最上边）
-    taskList.sort((a, b) => b.createdAt - a.createdAt);
+    // 按创建时间倒序；无 createdAt 时用 sendTime 兜底，避免 NaN 打乱排序
+    taskList.sort((a, b) => (b.createdAt || b.sendTime || 0) - (a.createdAt || a.sendTime || 0));
 
     if (taskList.length === 0) {
       editMessageText(chatId, messageId, "📭 当前暂无任何榜单发布记录。", { inline_keyboard: [[{ text: "🔙 返回控制面板", callback_data: "SETTINGS_MAIN" }]] });
@@ -4717,9 +4755,11 @@ function handleCallbackQuery(callbackQuery) {
 
   // 🟢 新增路由：预览榜单内容
   if (data.startsWith("SETTINGS_LB_PV_")) {
-    const parts = data.split("_");
-    const taskId = parts[3] + "_" + parts[4]; // 将截断的 TASK 与后面的数字拼接回完整 ID
-    const page = parts[5] || 0; // 提取页码，供返回按钮使用
+    // 🟢 稳健解析：去掉前缀后，最后一段是页码，前面整段是完整 taskId（兼容 TASK_ / 任意下划线）
+    const rest = data.replace("SETTINGS_LB_PV_", "");
+    const lastUnderscore = rest.lastIndexOf("_");
+    const taskId = lastUnderscore > 0 ? rest.substring(0, lastUnderscore) : rest;
+    const page = lastUnderscore > 0 ? (rest.substring(lastUnderscore + 1) || 0) : 0;
     const task = readFromFirebase(`schedule_queue/${taskId}`);
     
     if (!task) {
@@ -4815,16 +4855,17 @@ function handleCallbackQuery(callbackQuery) {
 
   // 🟢 新增路由：快捷删除与频道物理撤回
   if (data.startsWith("SETTINGS_LB_DEL_")) {
-    const parts = data.split("_");
-    const taskId = parts[3] + "_" + parts[4]; // 🟢 修复：拼接完整的 TASK_12345 格式
-    const page = parts[5]; // 🟢 修复：因为上一行多占了一个数组位，页码参数往后顺延到索引 5
+    // 🟢 稳健解析 taskId（兼容 TASK_时间戳 与历史幽灵 ID）
+    const rest = data.replace("SETTINGS_LB_DEL_", "");
+    const lastUnderscore = rest.lastIndexOf("_");
+    const taskId = lastUnderscore > 0 ? rest.substring(0, lastUnderscore) : rest;
+    const page = lastUnderscore > 0 ? (rest.substring(lastUnderscore + 1) || "0") : "0";
     const task = readFromFirebase(`schedule_queue/${taskId}`);
     
     if (task) {
-      // 核心防污染：若已发往公网频道，则利用 TG 权限强行同步物理撤回 (兼容单次与循环任务)
       const msgToDelete = task.messageId || task.lastMessageId;
-      if (msgToDelete) {
-        try { sendTelegramMessage("deleteMessage", { chat_id: task.target, message_id: msgToDelete }); } catch(e) {}
+      if (msgToDelete && task.target) {
+        try { sendTelegramMessage("deleteMessage", { chat_id: task.target, message_id: Number(msgToDelete) }); } catch(e) {}
       }
       deleteFirebase(`schedule_queue/${taskId}`);
       
@@ -4839,8 +4880,10 @@ function handleCallbackQuery(callbackQuery) {
 
   // 🟢 新增路由：触发重新编辑向导与实时变轨
   if (data.startsWith("SETTINGS_LB_EDIT_")) {
-    const parts = data.split("_");
-    const taskId = parts[3] + "_" + parts[4]; // 🟢 修复：拼接完整的 TASK_12345 格式
+    // 🟢 稳健解析：最后一段是页码，前面整段是 taskId
+    const rest = data.replace("SETTINGS_LB_EDIT_", "");
+    const lastUnderscore = rest.lastIndexOf("_");
+    const taskId = lastUnderscore > 0 ? rest.substring(0, lastUnderscore) : rest;
     const task = readFromFirebase(`schedule_queue/${taskId}`);
     
     if (!task) {
@@ -9508,7 +9551,21 @@ function processScheduledLeaderboards() {
   
   for (let id in tasks) {
     let task = tasks[id];
-    const now = new Date().getTime(); // 🟢 核心修复：把获取当前时间移入循环体内，避免任务休眠叠加导致共用旧时间轴引起判定乱窜
+    if (!task || typeof task !== 'object') continue;
+    // 🟢 跳过欢迎自毁等非发榜节点（历史 WELDEL_ 残留）
+    if (String(id).startsWith('WELDEL_') || (task.status == null && task.sendTime == null)) {
+      // 仅有 endTime 的旧 WELDEL：到期删消息后出队，避免永久占着节点
+      const nowSkip = new Date().getTime();
+      if (task.endTime && nowSkip >= task.endTime) {
+        const msgToDelete = task.messageId || task.lastMessageId;
+        if (msgToDelete && task.target) {
+          try { sendTelegramMessage("deleteMessage", { chat_id: task.target, message_id: Number(msgToDelete) }); } catch (e) {}
+        }
+        try { deleteFirebase(`schedule_queue/${id}`); } catch (e) {}
+      }
+      continue;
+    }
+    const now = new Date().getTime();// 🟢 核心修复：把获取当前时间移入循环体内，避免任务休眠叠加导致共用旧时间轴引起判定乱窜
     // 1. 全局检查：是否到达任务结束时间（适用于单次和循环）
             if (task.endTime && now >= task.endTime) {
               // 自动删除群里残留的最后一条消息
@@ -10215,13 +10272,16 @@ function setWebhook() {
         const triggersNow = ScriptApp.getProjectTriggers();
             // batchRecalcTeacherScores 已随车评系统移除，不再注入
 
-// 🟢 核心修复：自动注入关键词自动删除队列处理器（此前只有注释要求手动加触发器，导致时间到了从不删除）
+// 🟢 核心修复：自动注入删除队列处理器；并强制升级为每 1 分钟（GAS 最短周期）
+// 旧版 everyMinutes(2) 会导致“10秒自毁”实际最长等约 2 分钟，表现为偶发不删/删太慢
 const triggersFinal = ScriptApp.getProjectTriggers();
-let delQueueExists = triggersFinal.some(t => t.getHandlerFunction() === 'processAutoDeleteQueue');
-if (!delQueueExists) {
-  ScriptApp.newTrigger('processAutoDeleteQueue').timeBased().everyMinutes(2).create();
-  Logger.log("✅ 成功自动注入：processAutoDeleteQueue 定时触发器 (每2分钟)");
-}
+const delQueueTriggers = triggersFinal.filter(t => t.getHandlerFunction() === 'processAutoDeleteQueue');
+// 清掉旧的 2 分钟触发器，避免重复与旧周期残留
+delQueueTriggers.forEach(t => {
+  try { ScriptApp.deleteTrigger(t); } catch (e) {}
+});
+ScriptApp.newTrigger('processAutoDeleteQueue').timeBased().everyMinutes(1).create();
+Logger.log("✅ 已注入/升级：processAutoDeleteQueue 定时触发器 (每1分钟)");
   } catch (error) {
     Logger.log("❌ 自动注入触发器时发生异常: " + error.toString());
   }
@@ -10416,13 +10476,15 @@ function triggerWelcomeMessage(chatId, user) {
       // 彻底避免双库切换时发生对象合并污染导致欢迎配置丢失
       writeToFirebase(`welcome_last_msgs/${chatId}`, sentMsgId);
       
-      // 完美复用原有发榜基建，无缝下发异步自毁指令
+      // 🟢 修复：欢迎消息自毁改走 delete_queue，禁止写入 schedule_queue
+      // 否则会在「管理发布记录」里冒出幽灵条目，且删除回调解析不了 WELDEL_ 三段式 ID
       if (welcomeConfig.autoDeleteTime > 0) {
-        const taskId = 'WELDEL_' + new Date().getTime() + '_' + user.id;
-        writeToFirebase(`schedule_queue/${taskId}`, {
-           target: chatId,
-           messageId: sentMsgId,
-           endTime: new Date().getTime() + welcomeConfig.autoDeleteTime
+        const queueId = 'wel_del_' + new Date().getTime() + '_' + user.id;
+        writeToFirebase(`delete_queue/${queueId}`, {
+          chat_id: String(chatId),
+          bot_msg_id: sentMsgId,
+          user_msg_id: null,
+          expire_at: new Date().getTime() + Number(welcomeConfig.autoDeleteTime)
         });
       }
     }
@@ -10926,43 +10988,77 @@ function processScheduledStatusTasks() {
     try { refreshAllTeacherStatusBoards(); } catch (e) {}
   }
 }
-// ================= 🟢 新增：后台垃圾回收队列处理 (用于定时删除关键词及触发词) =================
-// ⚠️ 部署说明：由于GAS性能限制，请前往 Google Apps Script 左侧菜单的“触发器 (Triggers)”，
-// 为此函数 `processAutoDeleteQueue` 添加一个【时间驱动 (Time-driven)】 -> 【每分钟执行一次】 的触发器。
+// ================= 🟢 后台垃圾回收：到期自动删除（打卡提示/关键词回复等） =================
+// ⚠️ 触发器请设为「每 1 分钟」。GAS 无法稳定做到精确 10 秒轮询，1 分钟是官方最短周期。
+// 打卡成功路径另有“重逻辑结束后立刻尝试删除”的加速逻辑，多数情况下仍可接近 10 秒体感。
 function processAutoDeleteQueue() {
   const queueData = readFromFirebase('delete_queue');
   if (!queueData) return;
-  
+
   const now = new Date().getTime();
-  
+  // 单次最多处理 40 条，避免偶发队列堆积把触发器跑爆
+  let processed = 0;
+  const MAX_PER_RUN = 40;
+
   for (let key in queueData) {
+    if (processed >= MAX_PER_RUN) break;
+
     const task = queueData[key];
-    if (!task || !task.expire_at) continue;
-    
-    // 如果当前时间已超过设定的过期时间
-    if (now >= task.expire_at) {
-      // 🟢 核心修复：强制 Number(message_id) + String(chat_id)，与全项目其它 deleteMessage 保持一致，防止类型导致 API 静默失败
-      try {
-        if (task.user_msg_id) {
-          sendTelegramMessage("deleteMessage", {
-            chat_id: String(task.chat_id),
-            message_id: Number(task.user_msg_id)
-          });
-        }
-      } catch(e) {}
-      
-      try {
-        if (task.bot_msg_id) {
-          sendTelegramMessage("deleteMessage", {
-            chat_id: String(task.chat_id),
-            message_id: Number(task.bot_msg_id)
-          });
-        }
-      } catch(e) {}
-      
-      // 从数据库队列中彻底移除该任务，防止重复处理
-      writeToFirebase(`delete_queue/${key}`, null);
+    if (!task || !task.expire_at) {
+      // 脏数据直接清掉，防止永远占着节点
+      try { writeToFirebase(`delete_queue/${key}`, null); } catch (e) {}
+      continue;
     }
+
+    // 未到期跳过
+    if (now < Number(task.expire_at)) continue;
+
+    const chatId = String(task.chat_id);
+    let allTriedOk = true;
+
+    // 🟢 强制 Number(message_id) + String(chat_id)，避免类型导致 API 静默失败
+    if (task.user_msg_id) {
+      try {
+        const res = sendTelegramMessage("deleteMessage", {
+          chat_id: chatId,
+          message_id: Number(task.user_msg_id)
+        });
+        // 消息已删/找不到也视为完成；仅在明确限流时保留重试
+        try {
+          const data = JSON.parse(res.getContentText());
+          const desc = (data.description || "").toLowerCase();
+          if (!data.ok && (desc.includes("too many requests") || desc.includes("retry after"))) {
+            allTriedOk = false;
+          }
+        } catch (e) {}
+      } catch (e) {
+        allTriedOk = false;
+      }
+    }
+
+    if (task.bot_msg_id) {
+      try {
+        const res = sendTelegramMessage("deleteMessage", {
+          chat_id: chatId,
+          message_id: Number(task.bot_msg_id)
+        });
+        try {
+          const data = JSON.parse(res.getContentText());
+          const desc = (data.description || "").toLowerCase();
+          if (!data.ok && (desc.includes("too many requests") || desc.includes("retry after"))) {
+            allTriedOk = false;
+          }
+        } catch (e) {}
+      } catch (e) {
+        allTriedOk = false;
+      }
+    }
+
+    // 成功或“消息已不存在”都出队；仅限流时保留下周期重试
+    if (allTriedOk) {
+      try { writeToFirebase(`delete_queue/${key}`, null); } catch (e) {}
+    }
+    processed++;
   }
 }
 // 🟢 频道收录锁超时重试：把漏掉的 channel_post 补写进 teachers
@@ -11742,4 +11838,17 @@ function previewMenuButton(chatId, safeKey, messageId) {
       sendTelegramMessage("sendVideo", mediaPayload);
     }
   }
+}
+function cleanupGhostScheduleTasks() {
+  const tasks = readFromFirebase('schedule_queue') || {};
+  let n = 0;
+  for (let id in tasks) {
+    const t = tasks[id];
+    const isReal = String(id).startsWith('TASK_') || (t && t.status != null && t.sendTime != null);
+    if (!isReal) {
+      deleteFirebase('schedule_queue/' + id);
+      n++;
+    }
+  }
+  Logger.log('已清理幽灵任务: ' + n);
 }
