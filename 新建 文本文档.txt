@@ -1511,10 +1511,11 @@ if (text === '/rebuild_channel') {
     let teacherName = readFromFirebase('teacher_auth/' + userId);
     if (!teacherName && message.from && message.from.username) {
       teacherName = readFromFirebase('teacher_auth/' + message.from.username);
-      // 🟢 核心同步修复：当通过用户名匹配到老师时，强制补齐纯数字 ID 绑定。
-      // 彻底解决绑定老师后，打卡回调由于底层校验使用数字 ID 导致的状态不同步/无反应 BUG！
+      // 🟢 修复：不再额外写 teacher_auth/{userId}。之前这里会在"用户名绑定"的基础上
+      // 又新增一条"数字ID绑定"，导致同一老师在绑定列表里出现两行、解绑要点两次；
+      // 而 TSTATUS_ 等下游回调本身已有"先按ID查、查不到再按用户名查"的兜底，
+      // 不需要在这里预先补注册。只保留同步真实 tg_id 到老师资料，供后续主动私信通知使用。
       if (teacherName && typeof teacherName === 'string') {
-         writeToFirebase('teacher_auth/' + userId, teacherName);
          updateFirebase(`teachers/${teacherName}`, { tg_id: String(userId) });
       }
     }
@@ -1557,9 +1558,9 @@ if (text === '/rebuild_channel') {
                 let okTeacherName = readFromFirebase('teacher_auth/' + userId);
                 if (!okTeacherName && message.from && message.from.username) {
                   okTeacherName = readFromFirebase('teacher_auth/' + message.from.username);
-                  // 🟢 核心同步修复：当通过用户名匹配到老师时，强制补齐纯数字 ID 绑定。
+                  // 🟢 修复：同【⏰老师打卡】处的修复，不再写 teacher_auth/{userId}，
+                  // 避免和已有的用户名绑定记录重复；只同步 tg_id 到老师资料。
                   if (okTeacherName && typeof okTeacherName === 'string') {
-                     writeToFirebase('teacher_auth/' + userId, okTeacherName);
                      updateFirebase(`teachers/${okTeacherName}`, { tg_id: String(userId) });
                   }
                 }
@@ -1582,6 +1583,13 @@ if (text === '/rebuild_channel') {
                     ]
                   };
                   sendMessage(chatId, `📚 <b>老师开课控制台</b>；您好，<b>${escapeHtml(okTeacherName)}</b> 。请选择您当前的在岗状态：`, okStatusKeyboard, "HTML", message.message_id);
+
+                  // 🟢 修复：老师身份点击【📚开课】时，此前只弹出了上面的打卡控制台就直接结束，
+                  // 从未走到下面 else 分支里的 sendOpenClassList()，
+                  // 导致老师打卡后自己无论怎么点【📚开课】，都永远看不到"📚 当前在岗老师"列表
+                  // （该列表此前只有普通用户才能看到）。这里补上：控制台照常弹出的同时，
+                  // 紧接着把当前在岗老师列表也发给这位老师，两边信息都能看到。
+                  sendOpenClassList(chatId, userId, null, 0, null);
                 } else {
             // 普通用户 - 🟢 升级：调用分页函数展示在岗老师列表（首次进入第 0 页）
             // 🟢 核心修复：之前只传了 4 个参数，message.message_id 会顺位错塞进第 4 个形参 page，
@@ -4693,10 +4701,18 @@ function handleCallbackQuery(callbackQuery) {
     const tasks = readFromFirebase('schedule_queue') || {};
     let taskList = [];
     for (let id in tasks) {
-      taskList.push({ id: id, ...tasks[id] });
+      const t = tasks[id];
+      if (!t || typeof t !== 'object') continue;
+      // 🟢 只展示真正的定时发布任务，过滤 WELDEL_ 等系统内部自毁节点
+      // 判定：ID 以 TASK_ 开头，或同时具备 status + sendTime（兼容历史数据）
+      const isRealLb =
+        String(id).startsWith('TASK_') ||
+        (t.status != null && t.sendTime != null);
+      if (!isRealLb) continue;
+      taskList.push({ id: id, ...t });
     }
-    // 按创建时间倒序排列（最新的排在最上边）
-    taskList.sort((a, b) => b.createdAt - a.createdAt);
+    // 按创建时间倒序；无 createdAt 时用 sendTime 兜底，避免 NaN 打乱排序
+    taskList.sort((a, b) => (b.createdAt || b.sendTime || 0) - (a.createdAt || a.sendTime || 0));
 
     if (taskList.length === 0) {
       editMessageText(chatId, messageId, "📭 当前暂无任何榜单发布记录。", { inline_keyboard: [[{ text: "🔙 返回控制面板", callback_data: "SETTINGS_MAIN" }]] });
@@ -4747,9 +4763,11 @@ function handleCallbackQuery(callbackQuery) {
 
   // 🟢 新增路由：预览榜单内容
   if (data.startsWith("SETTINGS_LB_PV_")) {
-    const parts = data.split("_");
-    const taskId = parts[3] + "_" + parts[4]; // 将截断的 TASK 与后面的数字拼接回完整 ID
-    const page = parts[5] || 0; // 提取页码，供返回按钮使用
+    // 🟢 稳健解析：去掉前缀后，最后一段是页码，前面整段是完整 taskId（兼容 TASK_ / 任意下划线）
+    const rest = data.replace("SETTINGS_LB_PV_", "");
+    const lastUnderscore = rest.lastIndexOf("_");
+    const taskId = lastUnderscore > 0 ? rest.substring(0, lastUnderscore) : rest;
+    const page = lastUnderscore > 0 ? (rest.substring(lastUnderscore + 1) || 0) : 0;
     const task = readFromFirebase(`schedule_queue/${taskId}`);
     
     if (!task) {
@@ -4845,16 +4863,17 @@ function handleCallbackQuery(callbackQuery) {
 
   // 🟢 新增路由：快捷删除与频道物理撤回
   if (data.startsWith("SETTINGS_LB_DEL_")) {
-    const parts = data.split("_");
-    const taskId = parts[3] + "_" + parts[4]; // 🟢 修复：拼接完整的 TASK_12345 格式
-    const page = parts[5]; // 🟢 修复：因为上一行多占了一个数组位，页码参数往后顺延到索引 5
+    // 🟢 稳健解析 taskId（兼容 TASK_时间戳 与历史幽灵 ID）
+    const rest = data.replace("SETTINGS_LB_DEL_", "");
+    const lastUnderscore = rest.lastIndexOf("_");
+    const taskId = lastUnderscore > 0 ? rest.substring(0, lastUnderscore) : rest;
+    const page = lastUnderscore > 0 ? (rest.substring(lastUnderscore + 1) || "0") : "0";
     const task = readFromFirebase(`schedule_queue/${taskId}`);
     
     if (task) {
-      // 核心防污染：若已发往公网频道，则利用 TG 权限强行同步物理撤回 (兼容单次与循环任务)
       const msgToDelete = task.messageId || task.lastMessageId;
-      if (msgToDelete) {
-        try { sendTelegramMessage("deleteMessage", { chat_id: task.target, message_id: msgToDelete }); } catch(e) {}
+      if (msgToDelete && task.target) {
+        try { sendTelegramMessage("deleteMessage", { chat_id: task.target, message_id: Number(msgToDelete) }); } catch(e) {}
       }
       deleteFirebase(`schedule_queue/${taskId}`);
       
@@ -4869,8 +4888,10 @@ function handleCallbackQuery(callbackQuery) {
 
   // 🟢 新增路由：触发重新编辑向导与实时变轨
   if (data.startsWith("SETTINGS_LB_EDIT_")) {
-    const parts = data.split("_");
-    const taskId = parts[3] + "_" + parts[4]; // 🟢 修复：拼接完整的 TASK_12345 格式
+    // 🟢 稳健解析：最后一段是页码，前面整段是 taskId
+    const rest = data.replace("SETTINGS_LB_EDIT_", "");
+    const lastUnderscore = rest.lastIndexOf("_");
+    const taskId = lastUnderscore > 0 ? rest.substring(0, lastUnderscore) : rest;
     const task = readFromFirebase(`schedule_queue/${taskId}`);
     
     if (!task) {
@@ -8112,10 +8133,21 @@ function sendOpenClassList(chatId, userId, messageId, page, replyToMsgId) {
         message_id: okAllTeachers[name].message_id || null,
         channel_id: okAllTeachers[name].channel_id || PUBLISH_CHANNEL_ID,
         tg_id: okAllTeachers[name].tg_id || null,
-        username: okAllTeachers[name].username || null
+        username: okAllTeachers[name].username || null,
+        added_at: okAllTeachers[name].added_at || 0
       });
     }
   }
+
+  // 🟢 修复：强制稳定排序。Firebase 对象 key 顺序不保证，不同账号/不同时刻遍历顺序可能不同，
+  // 导致「📚开课」分页内容看起来不一致。统一：在岗列表按名字拼音/Unicode 升序，同名再按收录时间。
+  okOnlineList.sort((a, b) => {
+    const na = String(a.name || "");
+    const nb = String(b.name || "");
+    if (na < nb) return -1;
+    if (na > nb) return 1;
+    return (a.added_at || 0) - (b.added_at || 0);
+  });
 
   if (okOnlineList.length === 0) {
     const noMsg = "📚 当前暂时没有老师在线，请稍后再来查看～\n\n";
@@ -8179,7 +8211,17 @@ function sendOpenClassList(chatId, userId, messageId, page, replyToMsgId) {
         // 防误杀机制：频道级别不可用时不视为“老师已被删”
         const isChatDead = desc.includes('chat not found') || desc.includes('kicked') || desc.includes('deactivated') || desc.includes('not a member');
         
-        if (!d.ok && !isChatDead && desc && (desc.includes('message to edit not found') || desc.includes('message not found') || desc.includes('deleted'))) {
+        // 🟢 修复：仅在明确「帖子已删除」时剔除；限流/临时失败一律放行，避免 A 管理号看到在岗、B 管理号因探针偶发失败少人
+        if (!d.ok && !isChatDead && desc && (
+          desc.includes('message to edit not found') ||
+          desc.includes('message not found') ||
+          desc.includes('message to be replied not found') ||
+          desc.includes('deleted')
+        )) {
+          // 再排除限流类错误，防止 Too Many Requests 被误判成已删
+          if (desc.includes('too many requests') || desc.includes('retry after')) {
+            return true;
+          }
           deadTeachers.push(t.name);
           return false;
         }
@@ -8808,6 +8850,43 @@ function getTeacherStatusEmoji(status) {
 
 const TEACHER_LIST_PAGE_SIZE = 30; // 🟢 每页至少展示 30 位老师
 
+// 🟢 核心修复（API配额）：单次执行内的老师数据"快照缓存"。
+// 根因：refreshAllTeacherStatusBoards() 每次打卡/管理员操作/后台清理都会触发，
+// 循环遍历 status_boards 下所有已登记榜单时，每个榜单都会独立重新读一次 Firebase 的
+// 整张 teachers 表——刷新 40 个榜单就是 40 次几乎完全重复的 Firebase 读取。
+// Firebase 读写在本项目里也走 UrlFetchApp，和 Telegram API 共用同一份
+// 每日 20000（个人账号）/ 100000（Workspace）次的配额，这就是"一天不到就超限，
+// 超限后发消息、读数据库全部一起失灵"的核心原因。
+// 现在改为 5 秒内的重复请求直接复用同一份快照，一次刷新循环里的 N 个榜单共享 1 次 Firebase 读取。
+let _teachersSnapshotCache = null;
+let _teachersSnapshotCacheAt = 0;
+function getTeachersSnapshot() {
+  const now = new Date().getTime();
+  if (_teachersSnapshotCache && (now - _teachersSnapshotCacheAt) < 5000) {
+    return _teachersSnapshotCache;
+  }
+  _teachersSnapshotCache = readFromFirebase('teachers') || {};
+  _teachersSnapshotCacheAt = now;
+  return _teachersSnapshotCache;
+}
+
+// 🟢 核心修复（API配额）：同理，在岗榜自动删除分钟数配置也在同一次刷新循环里被每个榜单重复读取，一并做快照缓存
+let _autoDelMinCache = null;
+let _autoDelMinCacheAt = 0;
+function getStatusBoardAutoDeleteMinutes() {
+  const now = new Date().getTime();
+  if (_autoDelMinCache !== null && (now - _autoDelMinCacheAt) < 5000) {
+    return _autoDelMinCache;
+  }
+  let v = parseInt(readFromFirebase('system_config/status_board_auto_delete_minutes'), 10);
+  if (isNaN(v) || v < 0) v = 0;
+  if (v > 0 && v < 10) v = 10;
+  if (v > 360) v = 360;
+  _autoDelMinCache = v;
+  _autoDelMinCacheAt = now;
+  return v;
+}
+
 // 🟢 重构：渲染【管理员自定义的静态在岗面板】并实现状态热更新与自动分页
 function sendTeacherStatusBoard(chatId, tagIndex, page, messageId, replyToMsgId) {
   // 🟢 修复1：增加 if 判断，将【静态面板】与下方的【动态榜单】完美隔离开来
@@ -8824,7 +8903,8 @@ function sendTeacherStatusBoard(chatId, tagIndex, page, messageId, replyToMsgId)
     let safePage = 0;
     
     // 🟢 极限优化：提前一次性读取全部老师状态库，避免在下面的按钮循环中频繁触发数据库网络请求导致卡顿
-    const allTeachersData = readFromFirebase('teachers') || {};
+    // 🟢 核心修复（API配额）：改用单次执行内快照缓存，见 getTeachersSnapshot()
+    const allTeachersData = getTeachersSnapshot();
 
     // 1. 动态装载管理员配置的 Inline 按钮，解析 STATUS 同步变量并执行切片分页
     if (boardConfig.buttonsRaw) {
@@ -8914,7 +8994,9 @@ function sendTeacherStatusBoard(chatId, tagIndex, page, messageId, replyToMsgId)
            reply_markup: payload.reply_markup || { inline_keyboard: [] }
          });
          // 🟢 修复：翻页时要同步更新雷达缓存里的页码，不然下次别处打卡会导致该面板瞬间强制跳回第 0 页
-         writeToFirebase(`status_boards/${chatId}`, { chat_id: chatId, message_id: messageId, tag_index: 'STATIC', page: safePage });
+         writeToFirebase(`status_boards/${String(chatId)}_STATIC`, {
+  chat_id: chatId, message_id: messageId, tag_index: 'STATIC', page: safePage, updated_at: new Date().getTime()
+});
        } catch(e) {}
        return; // 更新完毕，立即返回
     }
@@ -8941,7 +9023,9 @@ function sendTeacherStatusBoard(chatId, tagIndex, page, messageId, replyToMsgId)
     try {
        const resData = JSON.parse(sendRes.getContentText());
        if (resData.ok && resData.result && resData.result.message_id) {
-         writeToFirebase(`status_boards/${chatId}`, { chat_id: chatId, message_id: resData.result.message_id, tag_index: 'STATIC', page: safePage });
+         writeToFirebase(`status_boards/${String(chatId)}_STATIC`, {
+  chat_id: chatId, message_id: resData.result.message_id, tag_index: 'STATIC', page: safePage, updated_at: new Date().getTime()
+});
        }
     } catch(e){}
     
@@ -8953,11 +9037,18 @@ function sendTeacherStatusBoard(chatId, tagIndex, page, messageId, replyToMsgId)
   const tagName = categoryTagList[tagIndex];
   if (!tagName) return;
 
-  const allTeachers = readFromFirebase('teachers') || {};
+  // 🟢 核心修复（API配额）：改用单次执行内快照缓存（见上方 getTeachersSnapshot），
+  // 避免 refreshAllTeacherStatusBoards() 循环刷新 N 个榜单时对 Firebase 重复读取 N 次
+  const allTeachers = getTeachersSnapshot();
   const teacherList = Object.keys(allTeachers)
       .filter(name => {
-        // 频道帖子已删除（message_id 为空）的老师直接从列表剔除，不显示任何按钮
-        if (!allTeachers[name].message_id) return false;
+        // 🟢 核心修复：不再要求 message_id 存在才能进列表！
+        // 旧代码只要没有 message_id（还没发资料帖 / 帖子已被撤回）就整条剔除，
+        // 但老师打卡【在岗】走的按钮回调和群关键词两条路径，从来都不写 message_id，
+        // 管理员手动面板(ATSS.)代打卡同样不写 message_id —— 这些老师在【老师状态管理】
+        // 和【📚开课列表】里都能正常显示🟢在岗，唯独在这里被 message_id 判断误杀，
+        // 造成"明明打卡在岗了，群里标签搜索却查不到"的表现。
+        // 现在只用"是否匹配标签"决定是否收录；有没有资料帖只影响下面按钮跳去哪，不再影响是否显示。
         
         // 🟢 修复：优先用 search_text（纯文本）；否则把 original_text 去 HTML 再匹配。
         // 解决「地址标签：大朗」等关键词因 HTML/转义导致 includes 失败、列表缺人的问题。
@@ -8975,7 +9066,10 @@ function sendTeacherStatusBoard(chatId, tagIndex, page, messageId, replyToMsgId)
       name: name,
       status: allTeachers[name].status, // online / offline / leave / undefined(从未打卡)
       added_at: allTeachers[name].added_at || 0,
-      message_id: allTeachers[name].message_id,
+      message_id: allTeachers[name].message_id || null,
+      // 🟢 新增：没有资料帖时，用于下方按钮直连老师本人的兜底字段
+      tg_id: allTeachers[name].tg_id || null,
+      username: allTeachers[name].username || null,
       // 🟢 核心修复 1：提取该老师专属的真实所在频道 ID，而不是用全局默认 ID
       channel_id: allTeachers[name].channel_id || PUBLISH_CHANNEL_ID 
     }))
@@ -8999,10 +9093,8 @@ function sendTeacherStatusBoard(chatId, tagIndex, page, messageId, replyToMsgId)
     const validTotalCount = Math.max(0, totalCount - deletedCountSoFar);
     const safeTagName = escapeHtml(tagName);
           // 🟢 读取自动删除配置，用于文案提示
-    let _autoMin = parseInt(readFromFirebase('system_config/status_board_auto_delete_minutes'), 10);
-    if (isNaN(_autoMin) || _autoMin < 0) _autoMin = 0;
-    if (_autoMin > 0 && _autoMin < 10) _autoMin = 10;
-    if (_autoMin > 360) _autoMin = 360;
+          // 🟢 核心修复（API配额）：改用快照缓存，见上方 getStatusBoardAutoDeleteMinutes()
+    let _autoMin = getStatusBoardAutoDeleteMinutes();
     let _delHint = "";
     if (_autoMin > 0) {
       _delHint = _autoMin >= 60
@@ -9032,7 +9124,11 @@ function sendTeacherStatusBoard(chatId, tagIndex, page, messageId, replyToMsgId)
       const chIdStr = String(t.channel_id || PUBLISH_CHANNEL_ID);
 
       let buttonUrl = "";
-      if (PUBLIC_CHANNEL_MAP[chIdStr]) {
+      // 🟢 核心修复：没有资料帖(message_id)时不再拼出 ".../undefined" 的坏链接，
+      // 改为跟【📚开课列表】一致的兜底逻辑——直连老师本人（有 username 优先，否则用 tg_id）
+      if (!t.message_id) {
+        buttonUrl = t.username ? `https://t.me/${t.username}` : (t.tg_id ? `tg://user?id=${t.tg_id}` : "");
+      } else if (PUBLIC_CHANNEL_MAP[chIdStr]) {
         // 公开频道：使用 https://t.me/用户名/消息ID 格式（未加群的用户也能直接查看）
         buttonUrl = `https://t.me/${PUBLIC_CHANNEL_MAP[chIdStr]}/${t.message_id}`;
       } else {
@@ -9040,6 +9136,10 @@ function sendTeacherStatusBoard(chatId, tagIndex, page, messageId, replyToMsgId)
         const targetChannelId = chIdStr.replace(/^-100/, '');
         buttonUrl = `https://t.me/c/${targetChannelId}/${t.message_id}`;
       }
+
+      // 🟢 极端兜底：资料帖、username、tg_id 三者都没有（仅靠名字匹配到标签）时没有可跳转链接，
+      // 跳过这一个按钮即可，不影响同一页其它老师正常显示
+      if (!buttonUrl) return;
 
             boardRow.push({ text: `${emoji} ${t.name}`, url: buttonUrl });
       if (boardRow.length === 2) {
@@ -9070,11 +9170,20 @@ function sendTeacherStatusBoard(chatId, tagIndex, page, messageId, replyToMsgId)
 
    let sentMessageId = messageId;
 
+  // 🟢 修复：按「群 + 标签」分别登记，避免同群搜「东莞」再搜「深圳」时互相覆盖，导致打卡后只有最后一个标签榜能同步状态
+  const boardTrackKey = String(chatId) + "_" + String(tagIndex);
+
   if (messageId) {
     payload.message_id = messageId;
     sendTelegramMessage("editMessageText", payload);
-    // 翻页/刷新时同步更新追踪记录的页码
-    writeToFirebase(`status_boards/${chatId}`, { chat_id: chatId, message_id: messageId, tag_index: tagIndex, page: safePage });
+    // 翻页/刷新时同步更新该标签对应追踪记录的页码
+    writeToFirebase(`status_boards/${boardTrackKey}`, {
+      chat_id: chatId,
+      message_id: messageId,
+      tag_index: tagIndex,
+      page: safePage,
+      updated_at: new Date().getTime()
+    });
   } else {
     if (replyToMsgId) {
       payload.reply_to_message_id = replyToMsgId;
@@ -9084,18 +9193,17 @@ function sendTeacherStatusBoard(chatId, tagIndex, page, messageId, replyToMsgId)
       const resultData = JSON.parse(sendResult.getContentText());
       if (resultData.ok && resultData.result && resultData.result.message_id) {
         sentMessageId = resultData.result.message_id;
-        writeToFirebase(`status_boards/${chatId}`, {
+        writeToFirebase(`status_boards/${boardTrackKey}`, {
           chat_id: chatId,
           message_id: sentMessageId,
           tag_index: tagIndex,
-          page: safePage
+          page: safePage,
+          updated_at: new Date().getTime()
         });
 
                 // 🟢 标签榜自动删除：读取设置（分钟），范围 10～360；0 或不设 = 关闭（空结果仍默认 10 秒清理）
-        let autoDelMin = parseInt(readFromFirebase('system_config/status_board_auto_delete_minutes'), 10);
-        if (isNaN(autoDelMin) || autoDelMin < 0) autoDelMin = 0;
-        if (autoDelMin > 0 && autoDelMin < 10) autoDelMin = 10;
-        if (autoDelMin > 360) autoDelMin = 360;
+                // 🟢 核心修复（API配额）：改用快照缓存，避免与上面 buildBoardPayload 内部重复读取同一个配置项
+        let autoDelMin = getStatusBoardAutoDeleteMinutes();
 
         if (autoDelMin > 0) {
           const expireAt = new Date().getTime() + autoDelMin * 60 * 1000;
@@ -9194,15 +9302,34 @@ function sendTeacherStatusBoard(chatId, tagIndex, page, messageId, replyToMsgId)
 
 // 🟢 新增：老师打卡状态发生变动后，自动把所有群里已展示过的【在岗榜】消息原位刷新一遍，做到实时同步
 function refreshAllTeacherStatusBoards() {
+  // 🟢 核心修复（API配额）：全局节流锁。打卡/管理员操作/后台清理等多达 9 处调用点，
+  // 短时间内密集触发时只让第一次真正执行一遍全量刷新，其余直接跳过，
+  // 防止同一批榜单在几秒内被反复整体刷新，进一步保护每日 UrlFetch 配额。
+  // 注：这只是"防止几秒内重复触发"，不影响正常间隔的打卡状态同步速度。
+  const _throttleCache = CacheService.getScriptCache();
+  if (_throttleCache.get('refresh_all_boards_lock')) {
+    Logger.log('⏭️ 跳过本次全量刷新在岗榜（几秒内已执行过一次，防止配额被打爆）');
+    return;
+  }
+  _throttleCache.put('refresh_all_boards_lock', '1', 6);
+
   const boards = readFromFirebase('status_boards');
   if (!boards) return;
-  for (let chatKey in boards) {
-    const board = boards[chatKey];
+
+  // 🟢 修复：同时兼容旧 key（纯 chatId）与新 key（chatId_tagIndex），保证历史登记的榜也能刷新
+  for (let boardKey in boards) {
+    const board = boards[boardKey];
     if (!board || !board.chat_id || !board.message_id || board.tag_index === undefined) continue;
     try {
       sendTeacherStatusBoard(board.chat_id, board.tag_index, board.page || 0, board.message_id);
     } catch (err) {
-      // 单条刷新失败（例如消息已被群管理员手动删除）不应影响其他群的刷新
+      // 消息已被删 / 自动删除队列清掉后：摘掉失效登记，避免下次反复空刷
+      try {
+        const errStr = String(err && (err.message || err) || "");
+        if (/message to edit not found|message not found|message is not modified|chat not found/i.test(errStr)) {
+          writeToFirebase(`status_boards/${boardKey}`, null);
+        }
+      } catch (e2) {}
     }
   }
 }
@@ -9445,9 +9572,12 @@ function checkAndDowngradeTeacherTiers() {
 }
 
 function cleanupDeletedTeachers() {
-  // 🟢 改为每 5 分钟执行一次（大幅降低 UrlFetch 消耗）
-  // 用分钟数取模，0/5/10/15... 才继续
-  if (new Date().getMinutes() % 5 !== 0) return;
+  // 🟢 核心修复：删除"分钟取模"拦截。
+  // 触发器本身已是 everyMinutes(5)，无需再靠 getMinutes()%5===0 二次把关；
+  // Apps Script 定时触发器不保证精确落在 0/5/10/15 这种整点分钟上，一旦触发
+  // 时刻的分钟数不能被 5 整除，本函数（含 processScheduledStatusTasks 定时
+  // 切换状态）就会被直接 return 跳过——这就是"时间到了却没有执行"的根因。
+  // 现在改为触发器每次触发都直接执行。
 
   // 🟢 加载动态配置（频道 ID 等）
   initGlobalConfig();
@@ -9538,7 +9668,21 @@ function processScheduledLeaderboards() {
   
   for (let id in tasks) {
     let task = tasks[id];
-    const now = new Date().getTime(); // 🟢 核心修复：把获取当前时间移入循环体内，避免任务休眠叠加导致共用旧时间轴引起判定乱窜
+    if (!task || typeof task !== 'object') continue;
+    // 🟢 跳过欢迎自毁等非发榜节点（历史 WELDEL_ 残留）
+    if (String(id).startsWith('WELDEL_') || (task.status == null && task.sendTime == null)) {
+      // 仅有 endTime 的旧 WELDEL：到期删消息后出队，避免永久占着节点
+      const nowSkip = new Date().getTime();
+      if (task.endTime && nowSkip >= task.endTime) {
+        const msgToDelete = task.messageId || task.lastMessageId;
+        if (msgToDelete && task.target) {
+          try { sendTelegramMessage("deleteMessage", { chat_id: task.target, message_id: Number(msgToDelete) }); } catch (e) {}
+        }
+        try { deleteFirebase(`schedule_queue/${id}`); } catch (e) {}
+      }
+      continue;
+    }
+    const now = new Date().getTime();// 🟢 核心修复：把获取当前时间移入循环体内，避免任务休眠叠加导致共用旧时间轴引起判定乱窜
     // 1. 全局检查：是否到达任务结束时间（适用于单次和循环）
             if (task.endTime && now >= task.endTime) {
               // 自动删除群里残留的最后一条消息
@@ -10449,13 +10593,15 @@ function triggerWelcomeMessage(chatId, user) {
       // 彻底避免双库切换时发生对象合并污染导致欢迎配置丢失
       writeToFirebase(`welcome_last_msgs/${chatId}`, sentMsgId);
       
-      // 完美复用原有发榜基建，无缝下发异步自毁指令
+      // 🟢 修复：欢迎消息自毁改走 delete_queue，禁止写入 schedule_queue
+      // 否则会在「管理发布记录」里冒出幽灵条目，且删除回调解析不了 WELDEL_ 三段式 ID
       if (welcomeConfig.autoDeleteTime > 0) {
-        const taskId = 'WELDEL_' + new Date().getTime() + '_' + user.id;
-        writeToFirebase(`schedule_queue/${taskId}`, {
-           target: chatId,
-           messageId: sentMsgId,
-           endTime: new Date().getTime() + welcomeConfig.autoDeleteTime
+        const queueId = 'wel_del_' + new Date().getTime() + '_' + user.id;
+        writeToFirebase(`delete_queue/${queueId}`, {
+          chat_id: String(chatId),
+          bot_msg_id: sentMsgId,
+          user_msg_id: null,
+          expire_at: new Date().getTime() + Number(welcomeConfig.autoDeleteTime)
         });
       }
     }
@@ -11809,4 +11955,17 @@ function previewMenuButton(chatId, safeKey, messageId) {
       sendTelegramMessage("sendVideo", mediaPayload);
     }
   }
+}
+function cleanupGhostScheduleTasks() {
+  const tasks = readFromFirebase('schedule_queue') || {};
+  let n = 0;
+  for (let id in tasks) {
+    const t = tasks[id];
+    const isReal = String(id).startsWith('TASK_') || (t && t.status != null && t.sendTime != null);
+    if (!isReal) {
+      deleteFirebase('schedule_queue/' + id);
+      n++;
+    }
+  }
+  Logger.log('已清理幽灵任务: ' + n);
 }
