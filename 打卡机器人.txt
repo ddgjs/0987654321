@@ -1511,10 +1511,11 @@ if (text === '/rebuild_channel') {
     let teacherName = readFromFirebase('teacher_auth/' + userId);
     if (!teacherName && message.from && message.from.username) {
       teacherName = readFromFirebase('teacher_auth/' + message.from.username);
-      // 🟢 核心同步修复：当通过用户名匹配到老师时，强制补齐纯数字 ID 绑定。
-      // 彻底解决绑定老师后，打卡回调由于底层校验使用数字 ID 导致的状态不同步/无反应 BUG！
+      // 🟢 修复：不再额外写 teacher_auth/{userId}。之前这里会在"用户名绑定"的基础上
+      // 又新增一条"数字ID绑定"，导致同一老师在绑定列表里出现两行、解绑要点两次；
+      // 而 TSTATUS_ 等下游回调本身已有"先按ID查、查不到再按用户名查"的兜底，
+      // 不需要在这里预先补注册。只保留同步真实 tg_id 到老师资料，供后续主动私信通知使用。
       if (teacherName && typeof teacherName === 'string') {
-         writeToFirebase('teacher_auth/' + userId, teacherName);
          updateFirebase(`teachers/${teacherName}`, { tg_id: String(userId) });
       }
     }
@@ -1557,9 +1558,9 @@ if (text === '/rebuild_channel') {
                 let okTeacherName = readFromFirebase('teacher_auth/' + userId);
                 if (!okTeacherName && message.from && message.from.username) {
                   okTeacherName = readFromFirebase('teacher_auth/' + message.from.username);
-                  // 🟢 核心同步修复：当通过用户名匹配到老师时，强制补齐纯数字 ID 绑定。
+                  // 🟢 修复：同【⏰老师打卡】处的修复，不再写 teacher_auth/{userId}，
+                  // 避免和已有的用户名绑定记录重复；只同步 tg_id 到老师资料。
                   if (okTeacherName && typeof okTeacherName === 'string') {
-                     writeToFirebase('teacher_auth/' + userId, okTeacherName);
                      updateFirebase(`teachers/${okTeacherName}`, { tg_id: String(userId) });
                   }
                 }
