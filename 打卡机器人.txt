@@ -9474,9 +9474,12 @@ function checkAndDowngradeTeacherTiers() {
 }
 
 function cleanupDeletedTeachers() {
-  // 🟢 改为每 5 分钟执行一次（大幅降低 UrlFetch 消耗）
-  // 用分钟数取模，0/5/10/15... 才继续
-  if (new Date().getMinutes() % 5 !== 0) return;
+  // 🟢 核心修复：删除"分钟取模"拦截。
+  // 触发器本身已是 everyMinutes(5)，无需再靠 getMinutes()%5===0 二次把关；
+  // Apps Script 定时触发器不保证精确落在 0/5/10/15 这种整点分钟上，一旦触发
+  // 时刻的分钟数不能被 5 整除，本函数（含 processScheduledStatusTasks 定时
+  // 切换状态）就会被直接 return 跳过——这就是"时间到了却没有执行"的根因。
+  // 现在改为触发器每次触发都直接执行。
 
   // 🟢 加载动态配置（频道 ID 等）
   initGlobalConfig();
