@@ -1583,6 +1583,13 @@ if (text === '/rebuild_channel') {
                     ]
                   };
                   sendMessage(chatId, `📚 <b>老师开课控制台</b>；您好，<b>${escapeHtml(okTeacherName)}</b> 。请选择您当前的在岗状态：`, okStatusKeyboard, "HTML", message.message_id);
+
+                  // 🟢 修复：老师身份点击【📚开课】时，此前只弹出了上面的打卡控制台就直接结束，
+                  // 从未走到下面 else 分支里的 sendOpenClassList()，
+                  // 导致老师打卡后自己无论怎么点【📚开课】，都永远看不到"📚 当前在岗老师"列表
+                  // （该列表此前只有普通用户才能看到）。这里补上：控制台照常弹出的同时，
+                  // 紧接着把当前在岗老师列表也发给这位老师，两边信息都能看到。
+                  sendOpenClassList(chatId, userId, null, 0, null);
                 } else {
             // 普通用户 - 🟢 升级：调用分页函数展示在岗老师列表（首次进入第 0 页）
             // 🟢 核心修复：之前只传了 4 个参数，message.message_id 会顺位错塞进第 4 个形参 page，
