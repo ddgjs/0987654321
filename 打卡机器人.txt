@@ -9856,6 +9856,78 @@ function parseCustomTime(timeStr) {
   return null;
 }
 
+// 🟢 核心新增（API配额，1000+老师场景专用）：批量版关注者通知。
+// 单老师版 notifyTeacherFollowers() 在"多位老师同时变更状态"场景下（比如每天定时批量下班）
+// 会被循环调用 N 次，每次都要重新扫描一遍全量 user_profiles 找该老师的关注者——
+// 老师规模到几百上千后，光是这个重复扫描 + 各自独立的 fetchAll 批次就会迅速堆积配额消耗。
+// 现在改为：只扫描一次 user_profiles，一次性收集"这一批所有变更老师 × 各自关注者"的完整通知清单，
+// 再统一按 20 条一批打包发送——无论这批状态变化涉及 1 位还是 1000 位老师，
+// Telegram 发送批次数只取决于真实需要发出的通知总条数，不再和老师数量线性叠加。
+function notifyMultipleTeachersFollowersBatched(teacherStatusMap, allTeachersSnap) {
+  const teacherNames = Object.keys(teacherStatusMap);
+  if (teacherNames.length === 0) return;
+
+  const statusMap = { online: "🟢 在岗", offline: "🔴 下班", leave: "🟡 休息" };
+
+  // 🟢 与单老师版共用同一个 cache key，谁先跑都能让另一个受益，60秒内不用重复读 Firebase
+  const cache = CacheService.getScriptCache();
+  const cacheKey = 'all_user_profiles_snap';
+  let allProfiles = null;
+  const cached = cache.get(cacheKey);
+  if (cached) {
+    try { allProfiles = JSON.parse(cached); } catch (e) {}
+  }
+  if (!allProfiles) {
+    allProfiles = readFromFirebase('user_profiles') || {};
+    try { cache.put(cacheKey, JSON.stringify(allProfiles), 60); } catch (e) { /* 超大对象可能放不进 Cache，忽略 */ }
+  }
+  if (!allProfiles || Object.keys(allProfiles).length === 0) return;
+
+  const channelNumericId = String(PUBLISH_CHANNEL_ID).replace(/^-100/, '');
+
+  // 一次遍历 user_profiles，收集本批次所有 (关注者uid, 老师名) 需要发送的通知对
+  const notifications = [];
+  for (let uid in allProfiles) {
+    const profile = allProfiles[uid];
+    if (!profile || !profile.follows) continue;
+    teacherNames.forEach(teacherName => {
+      if (profile.follows[teacherName]) {
+        notifications.push({ uid: uid, teacherName: teacherName });
+      }
+    });
+  }
+  if (notifications.length === 0) return;
+
+  // 按 20 条一批打包发送，批次数量只取决于通知总条数
+  const BATCH = 20;
+  for (let i = 0; i < notifications.length; i += BATCH) {
+    const batch = notifications.slice(i, i + BATCH);
+    const requests = batch.map(n => {
+      const td = allTeachersSnap[n.teacherName] || {};
+      const profileUrl = td.message_id ? `https://t.me/c/${channelNumericId}/${td.message_id}` : null;
+      const statusText = statusMap[teacherStatusMap[n.teacherName]];
+      const notifyText = `🔔 <b>关注动态提醒</b>\n\n您关注的老师 <b>${escapeHtml(n.teacherName)}</b> 刚刚更新了状态：\n${statusText}\n\n点击下方按钮查看资料详情 👇`;
+      const payload = { chat_id: n.uid, text: notifyText, parse_mode: "HTML" };
+      if (profileUrl) payload.reply_markup = { inline_keyboard: [[{ text: `📋 查看 ${n.teacherName} 资料`, url: profileUrl }]] };
+      return {
+        url: TG_API_URL + "sendMessage",
+        method: "post",
+        contentType: "application/json",
+        payload: JSON.stringify(payload),
+        muteHttpExceptions: true
+      };
+    });
+    try {
+      UrlFetchApp.fetchAll(requests);
+    } catch (e) {
+      // 单批失败不影响后续
+    }
+    if (i + BATCH < notifications.length) {
+      Utilities.sleep(300); // 批次间轻微间隔
+    }
+  }
+}
+
 // 🟢 新增：老师打卡状态变动时，遍历所有关注该老师的用户并私信推送通知
 function notifyTeacherFollowers(teacherName, statusText) {
   // 🟢 短缓存，避免同一分钟内多次全表扫描 user_profiles
@@ -11049,55 +11121,55 @@ function processScheduledStatusTasks() {
     return;
   }
 
-  // ========== 1. 批量写老师状态（一次 multi-path PATCH，大幅省 UrlFetch） ==========
-  const statusPatch = {};
-  changedNames.forEach(name => {
-    statusPatch[`teachers/${name}/status`] = teacherStatusMap[name];
-    statusPatch[`teachers/${name}/last_check_in`] = now;
-  });
-  // 用空 path 的 updateFirebase 实现多路径更新（你现有的 updateFirebase 支持）
-  try {
-    updateFirebase('', statusPatch);
-  } catch (e) {
-    // 兜底：逐个写
-    changedNames.forEach(name => {
-      updateFirebase(`teachers/${name}`, {
-        status: teacherStatusMap[name],
-        last_check_in: now
-      });
-    });
-  }
-
-  // ========== 2. 写打卡日志（仍逐条，但数量已可控） ==========
+  // ========== 1+2+3 合并（API配额核心修复，1000+老师场景专用）==========
+  // 原来是「1次状态PATCH + N次打卡日志单独写 + M次队列清理单独写」，
+  // 老师规模到几百上千后，仅打卡日志和队列清理这两步就是几百到上千次独立的 Firebase 写入，
+  // 且集中在同一秒内爆发，比日常分散打卡更容易瞬间打爆配额。
+  // Firebase 多路径 PATCH 支持一次性写入任意多个不同路径（哪怕分属 teachers / checkin_logs /
+  // status_schedule_queue 三张不同的表），现在把三步合并进同一个 patch 对象一次提交，
+  // 无论这一批同时有多少位老师下班/上班，这一步永远只消耗 1 次 UrlFetch 配额。
+  const combinedPatch = {};
   changedNames.forEach(name => {
     const st = teacherStatusMap[name];
-    writeToFirebase(`checkin_logs/${name}/${now}_${Math.floor(Math.random() * 1000)}`, {
+    combinedPatch[`teachers/${name}/status`] = st;
+    combinedPatch[`teachers/${name}/last_check_in`] = now;
+    combinedPatch[`checkin_logs/${name}/${now}_${Math.floor(Math.random() * 1000)}`] = {
       status: st,
       status_text: statusMap[st],
       operated_by: "schedule_auto",
       timestamp: now,
       time_string: new Date(now).toLocaleString("zh-CN", { timeZone: "Asia/Shanghai" })
-    });
+    };
+  });
+  taskIdsToDelete.forEach(id => {
+    combinedPatch[`status_schedule_queue/${id}`] = loopRewrite[id] || null;
   });
 
-  // ========== 3. 清理已执行任务 + 写回循环任务 ==========
-  taskIdsToDelete.forEach(id => {
-    if (loopRewrite[id]) {
-      writeToFirebase(`status_schedule_queue/${id}`, loopRewrite[id]);
-    } else {
-      writeToFirebase(`status_schedule_queue/${id}`, null);
-    }
-  });
+  try {
+    updateFirebase('', combinedPatch);
+  } catch (e) {
+    // 兜底：合并写入异常时逐项分开写，保证至少不丢数据（退回老路径，牺牲配额换可靠性）
+    changedNames.forEach(name => {
+      const st = teacherStatusMap[name];
+      try {
+        updateFirebase(`teachers/${name}`, { status: st, last_check_in: now });
+        writeToFirebase(`checkin_logs/${name}/${now}_${Math.floor(Math.random() * 1000)}`, {
+          status: st, status_text: statusMap[st], operated_by: "schedule_auto",
+          timestamp: now, time_string: new Date(now).toLocaleString("zh-CN", { timeZone: "Asia/Shanghai" })
+        });
+      } catch (e2) {}
+    });
+    taskIdsToDelete.forEach(id => {
+      try { writeToFirebase(`status_schedule_queue/${id}`, loopRewrite[id] || null); } catch (e3) {}
+    });
+  }
 
   anyDone = true;
 
-  // ========== 4. 关注通知（每个老师只通知一次） ==========
-  changedNames.forEach((teacherName, idx) => {
-    try {
-      if (idx > 0 && idx % 3 === 0) Utilities.sleep(200); // 轻微限速
-      notifyTeacherFollowers(teacherName, statusMap[teacherStatusMap[teacherName]]);
-    } catch (e) {}
-  });
+  // ========== 4. 关注通知（批量版：只扫描一次 user_profiles，按通知总条数打包发送） ==========
+  try {
+    notifyMultipleTeachersFollowersBatched(teacherStatusMap, allTeachersSnap);
+  } catch (e) {}
 
   // ========== 5. 只同步一次 ==========
   if (anyDone) {
