@@ -1207,37 +1207,64 @@ function handleMessage(message) {
             });
           }
 
-          // 🟢 提速：群内已回完，再跑重逻辑（榜单/定时消息按钮/关注通知）
-          try { refreshAllTeacherStatusBoards(); } catch (e) {}
-          try { syncScheduledMessagesStatus(teacherName); } catch (e) {}
-          try { notifyTeacherFollowers(teacherName, statusMap[status]); } catch (e) {}
+          // 🟢 核心修复：千人级并发打卡性能拯救！分离重逻辑！
+          // 当老师数量达到上千位时，每次打卡都在 Webhook 里同步去遍历千人名单刷榜、发成百上千条关注通知，
+          // 会导致严重的 Telegram API 限流 (Too Many Requests)、GAS 并发线程耗尽以及打卡后卡顿死锁无反应！
+          
+          // 1. 刷榜防抖锁 (Debounce)
+          try {
+             const cache = CacheService.getScriptCache();
+             // 如果 5 秒内有超多位老师同时打卡，只放行第一个去立刻刷榜，其余的全部写入异步队列由定时器合并兜底刷新
+             if (!cache.get('board_refresh_lock')) {
+                cache.put('board_refresh_lock', '1', 5); 
+                refreshAllTeacherStatusBoards(); 
+             } else {
+                writeToFirebase('system_tasks/pending_board_refresh', nowTs);
+             }
+          } catch (e) {}
 
-          // 🟢 加速删除：重逻辑结束后，若已接近/超过 10 秒，立刻删提示+触发消息并出队
-          // 多数打卡请求会在这里真正完成“约 10 秒自毁”，队列仅作兜底
+          // 2. 彻底剥离“海量粉丝关注通知”与“定时消息键盘同步”，压入底层异步队列
+          try { 
+             const taskId = `bg_task_${nowTs}_${Math.floor(Math.random() * 1000)}`;
+             writeToFirebase(`background_tasks/${taskId}`, {
+                type: 'teacher_status_changed',
+                teacher_name: teacherName,
+                status_text: statusMap[status],
+                timestamp: nowTs
+             });
+             
+             // ⚠️ 屏蔽原有的同步阻塞调用，避免并发雪崩与死锁
+             // syncScheduledMessagesStatus(teacherName); 
+             // notifyTeacherFollowers(teacherName, statusMap[status]); 
+          } catch (e) {}
+
+          // 🟢 核心修复：移除长达 8 秒的 Utilities.sleep 阻塞！
+          // 随着老师越来越多，高频打卡触发 sleep 会迅速耗尽 GAS 的 30 个并发线程上限。
+          // 导致后续的新打卡请求直接被 Google 拒收丢包（产生“状态依然是红的，不同步”现象）。
+          // 修复后：若重逻辑执行完后恰好超时，则顺手删除；若未超时，直接结束进程释放性能，交由 delete_queue 定时器异步兜底删除。
           try {
             const remain = expireAt - new Date().getTime();
-            // 剩余 1～12 秒时轻量等待，避免刷榜特别快时提示闪一下就没
-            if (remain > 1000 && remain <= 12000) {
-              Utilities.sleep(Math.min(remain, 8000));
-            }
-            if (message.message_id) {
-              try {
-                sendTelegramMessage("deleteMessage", {
-                  chat_id: String(chatId),
-                  message_id: Number(message.message_id)
-                });
-              } catch (e) {}
-            }
-            if (botMsgId) {
-              try {
-                sendTelegramMessage("deleteMessage", {
-                  chat_id: String(chatId),
-                  message_id: Number(botMsgId)
-                });
-              } catch (e) {}
-            }
-            if (checkinQueueId) {
-              try { writeToFirebase(`delete_queue/${checkinQueueId}`, null); } catch (e) {}
+            
+            if (remain <= 0) {
+              if (message.message_id) {
+                try {
+                  sendTelegramMessage("deleteMessage", {
+                    chat_id: String(chatId),
+                    message_id: Number(message.message_id)
+                  });
+                } catch (e) {}
+              }
+              if (botMsgId) {
+                try {
+                  sendTelegramMessage("deleteMessage", {
+                    chat_id: String(chatId),
+                    message_id: Number(botMsgId)
+                  });
+                } catch (e) {}
+              }
+              if (checkinQueueId) {
+                try { writeToFirebase(`delete_queue/${checkinQueueId}`, null); } catch (e) {}
+              }
             }
           } catch (e) {}
                 } else {
@@ -1439,9 +1466,7 @@ if (text === '/rebuild_channel') {
     const startParam = text.split(' ')[1];
     
     // 针对不同的后缀参数给出对应的提示或动作拦截
-    if (startParam === 'contact') {
-      sendMessage(chatId, "⚠️ 抱歉，系统尚未抓取到该老师的真实联系方式，暂时无法发起直连。\n您可以稍后再试，或在群内向管理员咨询。");
-    }
+    // (直连功能已移除)
 
     // 获取用户昵称（first_name），如果获取不到则默认叫"用户"
     const firstName = message.from.first_name || '用户';
@@ -1599,64 +1624,7 @@ if (text === '/rebuild_channel') {
           }
   
 
-  } else if (text === '💡投诉/建议') {
-    // 🟢 新增：投诉建议入口 (附带群组防刷屏自动转私聊逻辑)
-    if (String(chatId) !== String(userId)) {
-      // 在群组中触发
-      const promptMsg = "💡 <b>投诉与建议</b>\n\n欢迎您对群组运营、老师评价、功能改进等提出宝贵意见！\n\n👉 <b>请在下方直接输入您的反馈内容（支持纯文字）：</b>";
-      const cancelKeyboard = { inline_keyboard: [[{ text: "🔙 取消并关闭", callback_data: "CLOSE" }]] };
-      // 尝试主动推送私聊
-      const pushRes = sendMessage(userId, promptMsg, cancelKeyboard, "HTML");
-      let pushOk = false;
-      try { pushOk = pushRes && JSON.parse(pushRes.getContentText()).ok; } catch(e) {}
-
-      if (pushOk) {
-        // ✅ 私聊推送成功，写入状态，并删除群内触发口令
-        PropertiesService.getUserProperties().setProperty('state_' + userId, 'WAITING_FOR_FEEDBACK');
-        const mention = message.from.username ? `@${message.from.username}` : message.from.first_name;
-        // 🟢 修复：传入 message.message_id 实现“引用并回复”群员的原始消息
-        sendMessage(chatId, `✅ ${mention}，已自动为您发送私聊，请前往机器人对话框内填写反馈。`, null, "HTML", message.message_id);
-        try { sendTelegramMessage("deleteMessage", { chat_id: chatId, message_id: message.message_id }); } catch(e) {}
-      } else {
-        // ❌ 用户未启动机器人，给出跳转按钮
-        const mention = message.from.username ?
-        `@${message.from.username}` : message.from.first_name;
-        const jumpKb = { inline_keyboard: [[{ text: "👉 前往私聊进行反馈", url: BOT_USERNAME_URL }]] };
-        // 🟢 修复：传入 message.message_id 实现“引用并回复”群员的原始消息
-        sendMessage(chatId, `⚠️ ${mention}，由于您尚未启动机器人，请点击下方按钮前往私聊操作：`, jumpKb, "HTML", message.message_id);
-      }
-    } else {
-      // 在私聊中触发，直接走原有逻辑
-      PropertiesService.getUserProperties().setProperty('state_' + userId, 'WAITING_FOR_FEEDBACK');
-      const cancelKeyboard = { inline_keyboard: [[{ text: "🔙 取消并关闭", callback_data: "CLOSE" }]] };
-      sendMessage(chatId, "💡 <b>投诉与建议</b>\n\n欢迎您对群组运营、老师评价、功能改进等提出宝贵意见！\n\n👉 <b>请在下方直接输入您的反馈内容（支持纯文字）：</b>", cancelKeyboard, "HTML");
-    }
-    // ============= 第二套键盘按钮处理结束 =============
-
-  } else if (text === '📋申请上榜') {
-    // 🟢 升级：上榜申请入口 → 6步分步引导向导
-    const rankPromptMsg = "📋 <b>申请上榜 - 分步引导</b>\n\n共 6 步，请按提示逐步填写，填完后由管理员审核。\n\n📍 <b>第1步 / 共6步：请发送您的【地址/位置】</b>\n（例：上海市静安区XX路XX号）";
-    const rankCancelKb = { inline_keyboard: [[{ text: "🔙 取消", callback_data: "CLOSE" }]] };
-    if (String(chatId) !== String(userId)) {
-      const pushRes = sendMessage(userId, rankPromptMsg, rankCancelKb, "HTML");
-      let pushOk = false;
-      try { pushOk = pushRes && JSON.parse(pushRes.getContentText()).ok; } catch(e) {}
-      if (pushOk) {
-        PropertiesService.getUserProperties().setProperty('state_' + userId, 'WAITING_FOR_RANKING_ADDRESS');
-        PropertiesService.getUserProperties().setProperty('draft_ranking_' + userId, JSON.stringify({}));
-        const mention = message.from.username ? `@${message.from.username}` : message.from.first_name;
-        sendMessage(chatId, `✅ ${mention}，已自动为您发送私聊，请前往机器人对话框内提交上榜资料。`, null, "HTML");
-        try { sendTelegramMessage("deleteMessage", { chat_id: chatId, message_id: message.message_id }); } catch(e) {}
-      } else {
-        const mention = message.from.username ? `@${message.from.username}` : message.from.first_name;
-        const jumpKb = { inline_keyboard: [[{ text: "👉 前往私聊提交上榜资料", url: BOT_USERNAME_URL }]] };
-        sendMessage(chatId, `⚠️ ${mention}，由于您尚未启动机器人，请点击下方按钮前往私聊操作：`, jumpKb, "HTML");
-      }
-    } else {
-      PropertiesService.getUserProperties().setProperty('state_' + userId, 'WAITING_FOR_RANKING_ADDRESS');
-      PropertiesService.getUserProperties().setProperty('draft_ranking_' + userId, JSON.stringify({}));
-      sendMessage(chatId, rankPromptMsg, rankCancelKb, "HTML");
-    }
+  // ============= 第二套键盘按钮处理结束 =============
 
   } else {
     const state = PropertiesService.getUserProperties().getProperty('state_' + userId);
@@ -1831,208 +1799,8 @@ if (text === '/rebuild_channel') {
     if (state && state.startsWith('WAITING_FOR_')) {
       const field = state.replace('WAITING_FOR_', '');
       
-      if (field.startsWith('FBREPLY_')) {
-        // 🟢 核心新增：接收并处理管理员对投诉建议的回复
-        if (!text) {
-          sendMessage(chatId, "⚠️ 回复内容只能是纯文本，请重新输入！");
-          return;
-        }
-
-        // 🟢 解析新格式：FBREPLY_{targetUserId}_{feedbackId}（兼容旧格式：FBREPLY_{targetUserId}）
-        const fbreplyRaw = field.replace('FBREPLY_', '');
-        const fbreplyParts = fbreplyRaw.split('_');
-        // targetUserId 是纯数字（第0段），feedbackId 是 fb_时间戳_随机数（第1段起拼回）
-        const targetUserId = fbreplyParts[0];
-        const feedbackId = fbreplyParts.length >= 2 ? fbreplyParts.slice(1).join('_') : null;
-
-        PropertiesService.getUserProperties().deleteProperty('state_' + userId);
-        
-        // 构造回复内容并私聊发给目标用户
-        const replyToUser = `🔔 <b>管理员回复了您的投诉/建议：</b>\n\n💬 内容：\n<code>${escapeHtml(text)}</code>`;
-        const pushResult = sendMessage(targetUserId, replyToUser, null, "HTML");
-        
-        // 验证发送结果，并反馈给管理员
-        let isSuccess = false;
-        try {
-          if (pushResult && JSON.parse(pushResult.getContentText()).ok) {
-            isSuccess = true;
-          }
-        } catch (e) {}
-
-        if (isSuccess) {
-          // 🟢 回复成功后，更新 Firebase 状态为"已回复"，封锁其他管理员再次尝试
-          if (feedbackId) {
-            const adminName = message.from.first_name || `管理员${userId}`;
-            updateFirebase(`feedback_queue/${feedbackId}`, {
-              handled: true,
-              replied: true,
-              handlerName: adminName,
-              handlerId: String(userId)
-            });
-          }
-          sendMessage(chatId, `✅ 回复已成功发送给用户 <code>${targetUserId}</code>！`, null, "HTML");
-        } else {
-          sendMessage(chatId, `❌ 发送失败！用户 <code>${targetUserId}</code> 可能已屏蔽/封锁本机器人。`, null, "HTML");
-        }
-        return;
-
-      } else if (field === 'RANKING_ADDRESS') {
-        // 🟢 上榜向导第1步：接收地址
-        if (!text) {
-          sendMessage(chatId, "⚠️ 地址只能是纯文本，请重新输入！", { inline_keyboard: [[{ text: "🔙 取消", callback_data: "CLOSE" }]] });
-          return;
-        }
-        const rkDr1 = PropertiesService.getUserProperties().getProperty('draft_ranking_' + userId);
-        let rkD1 = rkDr1 ? JSON.parse(rkDr1) : {};
-        rkD1.address = text;
-        PropertiesService.getUserProperties().setProperty('draft_ranking_' + userId, JSON.stringify(rkD1));
-        PropertiesService.getUserProperties().setProperty('state_' + userId, 'WAITING_FOR_RANKING_PRICE');
-        sendMessage(chatId, "✅ 地址已保存！\n\n💰 <b>第2步 / 共6步：请发送您的【服务价格】</b>\n（例：200 USDT起 / 300 USDT/小时）", { inline_keyboard: [[{ text: "🔙 取消", callback_data: "CLOSE" }]] }, "HTML");
-        return;
-
-      } else if (field === 'RANKING_PRICE') {
-        // 🟢 上榜向导第2步：接收价格
-        if (!text) {
-          sendMessage(chatId, "⚠️ 价格只能是纯文本，请重新输入！", { inline_keyboard: [[{ text: "🔙 取消", callback_data: "CLOSE" }]] });
-          return;
-        }
-        const rkDr2 = PropertiesService.getUserProperties().getProperty('draft_ranking_' + userId);
-        let rkD2 = rkDr2 ? JSON.parse(rkDr2) : {};
-        rkD2.price = text;
-        PropertiesService.getUserProperties().setProperty('draft_ranking_' + userId, JSON.stringify(rkD2));
-        PropertiesService.getUserProperties().setProperty('state_' + userId, 'WAITING_FOR_RANKING_SERVICES');
-        sendMessage(chatId, "✅ 价格已保存！\n\n💆 <b>第3步 / 共6步：请填写您的【服务项目】</b>\n（例：全身推拿 / 精油SPA / 正骨）", { inline_keyboard: [[{ text: "🔙 取消", callback_data: "CLOSE" }]] }, "HTML");
-        return;
-
-      } else if (field === 'RANKING_SERVICES') {
-        // 🟢 上榜向导第3步：接收服务项目
-        if (!text) {
-          sendMessage(chatId, "⚠️ 服务项目只能是纯文本，请重新输入！", { inline_keyboard: [[{ text: "🔙 取消", callback_data: "CLOSE" }]] });
-          return;
-        }
-        const rkDr3 = PropertiesService.getUserProperties().getProperty('draft_ranking_' + userId);
-        let rkD3 = rkDr3 ? JSON.parse(rkDr3) : {};
-        rkD3.services = text;
-        PropertiesService.getUserProperties().setProperty('draft_ranking_' + userId, JSON.stringify(rkD3));
-        PropertiesService.getUserProperties().setProperty('state_' + userId, 'WAITING_FOR_RANKING_TYPE');
-        sendMessage(chatId, "✅ 服务项目已保存！\n\n✨ <b>第4步 / 共6步：请填写您的【类型特色】</b>\n（例：御姐型 / 邻家清纯 / 技术派）", { inline_keyboard: [[{ text: "🔙 取消", callback_data: "CLOSE" }]] }, "HTML");
-        return;
-
-      } else if (field === 'RANKING_TYPE') {
-        // 🟢 上榜向导第4步：接收类型特色，并初始化照片数组
-        if (!text) {
-          sendMessage(chatId, "⚠️ 类型特色只能是纯文本，请重新输入！", { inline_keyboard: [[{ text: "🔙 取消", callback_data: "CLOSE" }]] });
-          return;
-        }
-        const rkDr4 = PropertiesService.getUserProperties().getProperty('draft_ranking_' + userId);
-        let rkD4 = rkDr4 ? JSON.parse(rkDr4) : {};
-        rkD4.type_feature = text;
-        rkD4.photos = [];
-        PropertiesService.getUserProperties().setProperty('draft_ranking_' + userId, JSON.stringify(rkD4));
-        PropertiesService.getUserProperties().setProperty('state_' + userId, 'WAITING_FOR_RANKING_PHOTOS');
-        sendMessage(chatId, "✅ 类型特色已保存！\n\n📸 <b>第5步 / 共6步：请逐张上传【5张照片】</b>\n\n每发一张机器人会提示进度，发满5张后自动引导您上传课表。\n（若照片不足5张，可点提示中的跳过按钮）", { inline_keyboard: [[{ text: "🔙 取消", callback_data: "CLOSE" }]] }, "HTML");
-        return;
-
-      } else if (field === 'RANKING_PHOTOS') {
-        // 🟢 上榜向导第5步：接收照片（累积至5张后自动进入课表）
-        const rkDr5 = PropertiesService.getUserProperties().getProperty('draft_ranking_' + userId);
-        if (!rkDr5) {
-          sendMessage(chatId, "❌ 申请数据已丢失，请重新点击【📋申请上榜】按钮开始提交。");
-          PropertiesService.getUserProperties().deleteProperty('state_' + userId);
-          return;
-        }
-        let rkD5 = JSON.parse(rkDr5);
-        if (!rkD5.photos) rkD5.photos = [];
-        if (photo && photo.length > 0) {
-          rkD5.photos.push(photo[photo.length - 1].file_id);
-          PropertiesService.getUserProperties().setProperty('draft_ranking_' + userId, JSON.stringify(rkD5));
-          const cnt = rkD5.photos.length;
-          if (cnt >= 5) {
-            // 5张已满，自动进入课表上传
-            PropertiesService.getUserProperties().setProperty('state_' + userId, 'WAITING_FOR_RANKING_SCHEDULE');
-            sendMessage(chatId, `✅ <b>第 5/5 张照片已收到！</b>\n\n📅 <b>请发送您的【课表图片】（1张）：</b>\n\n若无课表可点击下方跳过。`,
-              { inline_keyboard: [
-                [{ text: "⏭️ 跳过课表，进入下一步", callback_data: "RANK_SKIP_SCHEDULE" }],
-                [{ text: "🔙 取消", callback_data: "CLOSE" }]
-              ] }, "HTML");
-          } else {
-            sendMessage(chatId, `✅ <b>第 ${cnt}/5 张照片已收到！</b>  还需 ${5 - cnt} 张，请继续发送。`,
-              { inline_keyboard: [
-                [{ text: `⏭️ 跳过剩余照片，去上传课表`, callback_data: "RANK_PHOTOS_DONE" }],
-                [{ text: "🔙 取消", callback_data: "CLOSE" }]
-              ] }, "HTML");
-          }
-        } else {
-          sendMessage(chatId, "⚠️ 格式错误！请直接发送<b>图片</b>（不支持视频/文件）。", { inline_keyboard: [[{ text: "🔙 取消", callback_data: "CLOSE" }]] }, "HTML");
-        }
-        return;
-
-      } else if (field === 'RANKING_SCHEDULE') {
-        // 🟢 上榜向导第5步(续)：接收课表图片，然后进入标签选择
-        const rkDr6 = PropertiesService.getUserProperties().getProperty('draft_ranking_' + userId);
-        if (!rkDr6) {
-          sendMessage(chatId, "❌ 申请数据已丢失，请重新点击【📋申请上榜】按钮开始提交。");
-          PropertiesService.getUserProperties().deleteProperty('state_' + userId);
-          return;
-        }
-        if (photo && photo.length > 0) {
-          let rkD6 = JSON.parse(rkDr6);
-          rkD6.schedule = photo[photo.length - 1].file_id;
-          PropertiesService.getUserProperties().setProperty('draft_ranking_' + userId, JSON.stringify(rkD6));
-          PropertiesService.getUserProperties().setProperty('state_' + userId, 'WAITING_FOR_RANKING_TAGS');
-          sendRankingTagsPanel(chatId, userId, null);
-        } else {
-          sendMessage(chatId, "⚠️ 格式错误！课表请直接发送<b>图片</b>，或点击下方跳过。",
-            { inline_keyboard: [
-              [{ text: "⏭️ 跳过课表，进入下一步", callback_data: "RANK_SKIP_SCHEDULE" }],
-              [{ text: "🔙 取消", callback_data: "CLOSE" }]
-            ] }, "HTML");
-        }
-        return;
-
-      } else if (field === 'RANKING_TAGS') {
-        // 🟢 上榜向导最终步：接收手动输入的自定义标签，并直接提交
-        if (!text) {
-          sendMessage(chatId, "⚠️ 请发送纯文本标签，或点击上方标签按钮选择后点击提交！", { inline_keyboard: [[{ text: "🔙 取消", callback_data: "CLOSE" }]] });
-          return;
-        }
-        const rkDr7 = PropertiesService.getUserProperties().getProperty('draft_ranking_' + userId);
-        if (!rkDr7) {
-          sendMessage(chatId, "❌ 申请数据已丢失，请重新点击【📋申请上榜】按钮开始提交。");
-          PropertiesService.getUserProperties().deleteProperty('state_' + userId);
-          return;
-        }
-        let rkD7 = JSON.parse(rkDr7);
-        // 合并手动标签与已选标签
-        const manualTags = text.split(/[\s,，]+/).map(t => t.replace(/#/g,'').trim()).filter(t => t.length > 0);
-        rkD7.tags = [...new Set([...(rkD7.tags || []), ...manualTags])];
-        PropertiesService.getUserProperties().setProperty('draft_ranking_' + userId, JSON.stringify(rkD7));
-        submitRankingApplication(chatId, userId, message.from);
-        return;
-
-      } else if (field.startsWith('RANKING_REJ_REASON_')) {
-        // 🟢 新增：接收管理员填写的上榜申请拒绝理由
-        if (!text) {
-          sendMessage(chatId, "⚠️ 拒绝理由只能是纯文本，请重新输入！");
-          return;
-        }
-        const rrParts = field.replace('RANKING_REJ_REASON_', '').split('_');
-        const rrSubmissionId = rrParts[0]; // 例：rnk1750000000000
-        const rrSubmitterId = rrParts[1];  // 例：8990999607
-        const rrSub = readFromFirebase(`ranking_submissions/${rrSubmissionId}`);
-        if (!rrSub || rrSub.status !== 'pending') {
-          sendMessage(chatId, "❌ 该申请已不存在或已被其他管理员处理。");
-          PropertiesService.getUserProperties().deleteProperty('state_' + userId);
-          return;
-        }
-        writeToFirebase(`ranking_submissions/${rrSubmissionId}/status`, 'rejected');
-        PropertiesService.getUserProperties().deleteProperty('state_' + userId);
-        sendMessage(chatId, "✅ 拒绝理由已成功发送给该用户！");
-        sendMessage(rrSubmitterId, `❌ <b>上榜申请未通过审核</b>\n\n您提交的上榜申请（编号：<code>${rrSubmissionId}</code>）未通过管理员审核。\n\n📝 <b>管理员给出的拒绝理由：</b>\n<code>${escapeHtml(text)}</code>`, null, "HTML");
-        return;
-
       // === 🟢 新增：接收强制关注频道的设置输入 ===
-      } else if (field === 'FORCESUB_CHANNEL') {
+      if (field === 'FORCESUB_CHANNEL') {
         const cancelKeyboard = { inline_keyboard: [[{ text: "🔙 取消并返回", callback_data: "SETTINGS_MAIN" }]] };
         
         // 允许管理员输入“关闭”来彻底停用该功能
@@ -5133,7 +4901,11 @@ function handleCallbackQuery(callbackQuery) {
       const parts = rest.split("_");
       page = parseInt(parts[0], 10) || 0;
       const idx = parseInt(parts[1], 10) || 0;
-      const allTeachers = readFromFirebase('teachers') || {};
+      // 🟢 核心修复（1000+老师场景）：改用 getTeachersSnapshot() 走 5 秒快照缓存。
+      // 本处理器resolve完name后马上会调用 sendSchStatusPicker 重绘列表，
+      // 重绘内部还会再读一次 teachers 表——同一次点击等于读了2次整表，
+      // 换成共享快照后同一次点击只需真正读1次 Firebase。
+      const allTeachers = getTeachersSnapshot();
       const names = Object.keys(allTeachers)
         .filter(n => {
           const t = allTeachers[n];
@@ -5174,14 +4946,18 @@ function handleCallbackQuery(callbackQuery) {
   }
 
   if (data === "SCHS_ALL") {
-    const allTeachers = readFromFirebase('teachers') || {};
+    // 🟢 核心修复（1000+老师场景）：改用 getTeachersSnapshot() 走 5 秒快照缓存，
+    // 原因同 SCHS_TOGGLE_——本函数结尾也会调用 sendSchStatusPicker 重绘，
+    // 避免同一次点击里对整张 teachers 表重复读取两次
+    const allTeachers = getTeachersSnapshot();
     let draft = getSchsDraft(userId);
     draft.selected = {};
     let count = 0;
-    const MAX_BATCH = 200;
-    // 🟢 与 sendSchStatusPicker / 管理老师状态 统一：仅 message_id 或 tg_id，排除幽灵残留
+    // 🟢 核心修复（1000+老师场景）：去掉 200 人的单次硬上限。
+    // 老师规模超过 200 后，"全选全部"实际上只会选中 Object.keys 原始顺序里的前 200 个
+    // （并非按加入时间排序），管理员会误以为已覆盖所有人，实际上有几百位老师
+    // 完全没被排进定时任务——这是功能性 bug，不是配额保护，配合上面的展示层修复可以安全解除。
     Object.keys(allTeachers).forEach(n => {
-      if (count >= MAX_BATCH) return;
       const t = allTeachers[n];
       if (t && typeof t === 'object' && (t.message_id || t.tg_id)) {
         draft.selected[n] = true;
@@ -5190,7 +4966,7 @@ function handleCallbackQuery(callbackQuery) {
     });
     setSchsDraft(userId, draft);
     sendSchStatusPicker(chatId, messageId, userId, 0);
-    answerCallbackQuery(callbackQueryId, count >= MAX_BATCH ? ("✅ 已选前 " + MAX_BATCH + " 位（单次上限）") : "✅ 已全选");
+    answerCallbackQuery(callbackQueryId, "✅ 已全选 " + count + " 位老师");
     return;
   }
 
@@ -5345,7 +5121,7 @@ function handleCallbackQuery(callbackQuery) {
     };
     editMessageText(chatId, messageId,
       `✅ <b>定时任务已创建</b>\n\n` +
-      `👥 老师：${names.map(n => escapeHtml(n)).join("、")}\n` +
+      `👥 老师：${summarizeTeacherNames(names, 10)}\n` +
       `📌 目标状态：${statusMap[draft.status]}\n` +
       `⏳ 时间：${delayLabel}\n` +
       `🔁 每日循环：${loopOn ? "✅ 开" : "❌ 关"}\n` +
@@ -9856,6 +9632,81 @@ function parseCustomTime(timeStr) {
   return null;
 }
 
+// 🟢 核心新增（API配额，1000+老师场景专用）：批量版关注者通知。
+// 单老师版 notifyTeacherFollowers() 在"多位老师同时变更状态"场景下（比如每天定时批量下班）
+// 会被循环调用 N 次，每次都要重新扫描一遍全量 user_profiles 找该老师的关注者——
+// 老师规模到几百上千后，光是这个重复扫描 + 各自独立的 fetchAll 批次就会迅速堆积配额消耗。
+// 现在改为：只扫描一次 user_profiles，一次性收集"这一批所有变更老师 × 各自关注者"的完整通知清单，
+// 再统一按 20 条一批打包发送——无论这批状态变化涉及 1 位还是 1000 位老师，
+// Telegram 发送批次数只取决于真实需要发出的通知总条数，不再和老师数量线性叠加。
+function notifyMultipleTeachersFollowersBatched(teacherStatusMap, allTeachersSnap) {
+  const teacherNames = Object.keys(teacherStatusMap);
+  if (teacherNames.length === 0) return;
+
+  const statusMap = { online: "🟢 在岗", offline: "🔴 下班", leave: "🟡 休息" };
+
+  // 🟢 与单老师版共用同一个 cache key，谁先跑都能让另一个受益，60秒内不用重复读 Firebase
+  const cache = CacheService.getScriptCache();
+  const cacheKey = 'all_user_profiles_snap';
+  let allProfiles = null;
+  const cached = cache.get(cacheKey);
+  if (cached) {
+    try { allProfiles = JSON.parse(cached); } catch (e) {}
+  }
+  if (!allProfiles) {
+    allProfiles = readFromFirebase('user_profiles') || {};
+    try { cache.put(cacheKey, JSON.stringify(allProfiles), 60); } catch (e) { /* 超大对象可能放不进 Cache，忽略 */ }
+  }
+  if (!allProfiles || Object.keys(allProfiles).length === 0) return;
+
+  const channelNumericId = String(PUBLISH_CHANNEL_ID).replace(/^-100/, '');
+
+  // 🟢 核心修复（1000+老师场景）：原来是"每个关注者 × 本批次每一位变更老师"双重遍历，
+  // 复杂度 O(关注者数 × 本批次老师数)；"全选全部"一次性把 1000+ 位老师排进同一个定时任务时，
+  // 这层循环次数会随老师数线性膨胀。改成遍历"每个用户实际关注的老师"（人均通常只有个位数到几十个），
+  // 复杂度降为 O(关注者数 × 人均关注数)，与本批次改了多少位老师无关。
+  const notifications = [];
+  for (let uid in allProfiles) {
+    const profile = allProfiles[uid];
+    if (!profile || !profile.follows) continue;
+    for (let followedName in profile.follows) {
+      if (profile.follows[followedName] && teacherStatusMap[followedName]) {
+        notifications.push({ uid: uid, teacherName: followedName });
+      }
+    }
+  }
+  if (notifications.length === 0) return;
+
+  // 按 20 条一批打包发送，批次数量只取决于通知总条数
+  const BATCH = 20;
+  for (let i = 0; i < notifications.length; i += BATCH) {
+    const batch = notifications.slice(i, i + BATCH);
+    const requests = batch.map(n => {
+      const td = allTeachersSnap[n.teacherName] || {};
+      const profileUrl = td.message_id ? `https://t.me/c/${channelNumericId}/${td.message_id}` : null;
+      const statusText = statusMap[teacherStatusMap[n.teacherName]];
+      const notifyText = `🔔 <b>关注动态提醒</b>\n\n您关注的老师 <b>${escapeHtml(n.teacherName)}</b> 刚刚更新了状态：\n${statusText}\n\n点击下方按钮查看资料详情 👇`;
+      const payload = { chat_id: n.uid, text: notifyText, parse_mode: "HTML" };
+      if (profileUrl) payload.reply_markup = { inline_keyboard: [[{ text: `📋 查看 ${n.teacherName} 资料`, url: profileUrl }]] };
+      return {
+        url: TG_API_URL + "sendMessage",
+        method: "post",
+        contentType: "application/json",
+        payload: JSON.stringify(payload),
+        muteHttpExceptions: true
+      };
+    });
+    try {
+      UrlFetchApp.fetchAll(requests);
+    } catch (e) {
+      // 单批失败不影响后续
+    }
+    if (i + BATCH < notifications.length) {
+      Utilities.sleep(300); // 批次间轻微间隔
+    }
+  }
+}
+
 // 🟢 新增：老师打卡状态变动时，遍历所有关注该老师的用户并私信推送通知
 function notifyTeacherFollowers(teacherName, statusText) {
   // 🟢 短缓存，避免同一分钟内多次全表扫描 user_profiles
@@ -10799,7 +10650,10 @@ function clearSchsDraft(userId) {
 // ================= 🟢 定时切换老师状态：UI + 队列 =================
 
 function sendSchStatusPicker(chatId, messageId, userId, page) {
-  const allTeachers = readFromFirebase('teachers') || {};
+  // 🟢 核心修复（1000+老师场景）：改用 getTeachersSnapshot() 走 5 秒快照缓存。
+  // 这是 SCHS_TOGGLE_ / SCHS_ALL / SCHS_PAGE_ / 打开向导 共用的重绘函数，
+  // 老师上千后表体积变大，每次重绘都整表重读会明显加重 Firebase 读配额压力
+  const allTeachers = getTeachersSnapshot();
   // 🟢 核心修复：与「管理老师状态」统一严格过滤
   // 只保留仍有频道帖（message_id）或仍绑定老师（tg_id）的记录
   // 频道已删 + 解绑后残留的 original_text / status / teacher_code 不再进入列表
@@ -10962,7 +10816,21 @@ function getNextDailyExecuteAt(hh, mm) {
   }
   return candidate.getTime();
 }
-
+// 🟢 核心修复（1000+老师场景）：老师名单摘要化辅助函数。
+// 单个定时任务在"老师达到上千位以上"时，selected 名单可能有几百到上千个名字，
+// 如果直接 join 拼进 Telegram 消息文本，很容易单条撑爆 4096 字符的官方硬上限，
+// 导致 sendMessage/editMessageText 静默失败（本项目统一用 muteHttpExceptions:true，
+// 调用处又没检查 ok 字段，管理员只会看到面板"没反应"，查不出原因）。
+// 现在改为：数量少时正常展示全部，数量多时只展示前 N 个 + "等共 X 位"。
+function summarizeTeacherNames(names, maxShow) {
+  maxShow = maxShow || 6;
+  if (!names || names.length === 0) return "（无）";
+  if (names.length <= maxShow) {
+    return names.map(n => escapeHtml(n)).join("、");
+  }
+  const shown = names.slice(0, maxShow).map(n => escapeHtml(n)).join("、");
+  return `${shown} 等共 ${names.length} 位`;
+}
 function sendSchStatusTaskList(chatId, messageId) {
   const tasks = readFromFirebase('status_schedule_queue') || {};
   const ids = Object.keys(tasks).sort((a, b) => (tasks[a].execute_at || 0) - (tasks[b].execute_at || 0));
@@ -10977,16 +10845,32 @@ function sendSchStatusTaskList(chatId, messageId) {
     return;
   }
 
+  // 🟢 核心修复：给 HTML 标签、时间戳等预留余量，文本安全上限设在 Telegram 4096 硬限制之内
+  const TEXT_SAFE_LIMIT = 3500;
   let text = `📋 <b>定时状态任务</b>（共 ${ids.length} 条）\n\n`;
   let keyboard = [];
-  ids.forEach((id, idx) => {
+  let shownCount = 0;
+
+  for (let idx = 0; idx < ids.length; idx++) {
+    const id = ids[idx];
     const t = tasks[id];
     const timeStr = new Date(t.execute_at).toLocaleString("zh-CN", { timeZone: "Asia/Shanghai" });
-    const names = (t.teacher_names || []).join("、");
+    // 🟢 核心修复：老师数量多时只摘要展示前几位+总数，不再整段 join 全部姓名
+    const names = summarizeTeacherNames(t.teacher_names || [], 6);
     const loopTag = t.loop ? " 🔁循环" : "";
-    text += `${idx + 1}. ${statusMap[t.target_status] || t.target_status} | ${escapeHtml(names)}${loopTag}\n   🕒 ${timeStr}（${t.delay_label || ""}）\n`;
+    const line = `${idx + 1}. ${statusMap[t.target_status] || t.target_status} | ${names}${loopTag}\n   🕒 ${timeStr}（${t.delay_label || ""}）\n`;
+
+    // 🟢 核心修复：任务条数多时也不能让总文本超过安全阈值，超出就截断并提示，而不是发送失败
+    if (text.length + line.length > TEXT_SAFE_LIMIT) {
+      text += `\n……还有 ${ids.length - shownCount} 条任务未显示，请先取消部分任务后再查看。`;
+      break;
+    }
+
+    text += line;
     keyboard.push([{ text: `🗑️ 取消 #${idx + 1}`, callback_data: `SCHS_DEL_${id}` }]);
-  });
+    shownCount++;
+  }
+
   keyboard.push([{ text: "⏰ 新建定时任务", callback_data: "SETTINGS_SCH_STATUS_0" }]);
   keyboard.push([{ text: "🔙 返回控制面板", callback_data: "SETTINGS_MAIN" }]);
   editMessageText(chatId, messageId, text, { inline_keyboard: keyboard }, "HTML");
@@ -11049,55 +10933,55 @@ function processScheduledStatusTasks() {
     return;
   }
 
-  // ========== 1. 批量写老师状态（一次 multi-path PATCH，大幅省 UrlFetch） ==========
-  const statusPatch = {};
-  changedNames.forEach(name => {
-    statusPatch[`teachers/${name}/status`] = teacherStatusMap[name];
-    statusPatch[`teachers/${name}/last_check_in`] = now;
-  });
-  // 用空 path 的 updateFirebase 实现多路径更新（你现有的 updateFirebase 支持）
-  try {
-    updateFirebase('', statusPatch);
-  } catch (e) {
-    // 兜底：逐个写
-    changedNames.forEach(name => {
-      updateFirebase(`teachers/${name}`, {
-        status: teacherStatusMap[name],
-        last_check_in: now
-      });
-    });
-  }
-
-  // ========== 2. 写打卡日志（仍逐条，但数量已可控） ==========
+  // ========== 1+2+3 合并（API配额核心修复，1000+老师场景专用）==========
+  // 原来是「1次状态PATCH + N次打卡日志单独写 + M次队列清理单独写」，
+  // 老师规模到几百上千后，仅打卡日志和队列清理这两步就是几百到上千次独立的 Firebase 写入，
+  // 且集中在同一秒内爆发，比日常分散打卡更容易瞬间打爆配额。
+  // Firebase 多路径 PATCH 支持一次性写入任意多个不同路径（哪怕分属 teachers / checkin_logs /
+  // status_schedule_queue 三张不同的表），现在把三步合并进同一个 patch 对象一次提交，
+  // 无论这一批同时有多少位老师下班/上班，这一步永远只消耗 1 次 UrlFetch 配额。
+  const combinedPatch = {};
   changedNames.forEach(name => {
     const st = teacherStatusMap[name];
-    writeToFirebase(`checkin_logs/${name}/${now}_${Math.floor(Math.random() * 1000)}`, {
+    combinedPatch[`teachers/${name}/status`] = st;
+    combinedPatch[`teachers/${name}/last_check_in`] = now;
+    combinedPatch[`checkin_logs/${name}/${now}_${Math.floor(Math.random() * 1000)}`] = {
       status: st,
       status_text: statusMap[st],
       operated_by: "schedule_auto",
       timestamp: now,
       time_string: new Date(now).toLocaleString("zh-CN", { timeZone: "Asia/Shanghai" })
-    });
+    };
+  });
+  taskIdsToDelete.forEach(id => {
+    combinedPatch[`status_schedule_queue/${id}`] = loopRewrite[id] || null;
   });
 
-  // ========== 3. 清理已执行任务 + 写回循环任务 ==========
-  taskIdsToDelete.forEach(id => {
-    if (loopRewrite[id]) {
-      writeToFirebase(`status_schedule_queue/${id}`, loopRewrite[id]);
-    } else {
-      writeToFirebase(`status_schedule_queue/${id}`, null);
-    }
-  });
+  try {
+    updateFirebase('', combinedPatch);
+  } catch (e) {
+    // 兜底：合并写入异常时逐项分开写，保证至少不丢数据（退回老路径，牺牲配额换可靠性）
+    changedNames.forEach(name => {
+      const st = teacherStatusMap[name];
+      try {
+        updateFirebase(`teachers/${name}`, { status: st, last_check_in: now });
+        writeToFirebase(`checkin_logs/${name}/${now}_${Math.floor(Math.random() * 1000)}`, {
+          status: st, status_text: statusMap[st], operated_by: "schedule_auto",
+          timestamp: now, time_string: new Date(now).toLocaleString("zh-CN", { timeZone: "Asia/Shanghai" })
+        });
+      } catch (e2) {}
+    });
+    taskIdsToDelete.forEach(id => {
+      try { writeToFirebase(`status_schedule_queue/${id}`, loopRewrite[id] || null); } catch (e3) {}
+    });
+  }
 
   anyDone = true;
 
-  // ========== 4. 关注通知（每个老师只通知一次） ==========
-  changedNames.forEach((teacherName, idx) => {
-    try {
-      if (idx > 0 && idx % 3 === 0) Utilities.sleep(200); // 轻微限速
-      notifyTeacherFollowers(teacherName, statusMap[teacherStatusMap[teacherName]]);
-    } catch (e) {}
-  });
+  // ========== 4. 关注通知（批量版：只扫描一次 user_profiles，按通知总条数打包发送） ==========
+  try {
+    notifyMultipleTeachersFollowersBatched(teacherStatusMap, allTeachersSnap);
+  } catch (e) {}
 
   // ========== 5. 只同步一次 ==========
   if (anyDone) {
@@ -11427,6 +11311,21 @@ function applyAntispamPenalty(chatId, userId, action, reasonText, chatType) {
     reason = "本群是普通群组（非超级群），Telegram 不支持禁言/踢人/封禁。请把群升级为超级群后再使用此功能。";
     console.error("applyAntispamPenalty 跳过: chatType=" + chatType + " chatId=" + cid);
     return { ok: false, reason: reason };
+  }
+
+  // 🟢 核心新增：目标是群主时，ban/restrict/kick 在 Telegram 平台层面必定失败（can't remove/restrict chat owner），
+  // 且该限制不受机器人权限影响、无法绕过。提前用 getChatMember 探测身份，命中就短路返回，
+  // 避免白打一次注定失败的 API，失败提示也换成准确的中文原因，不再误导去查权限
+  try {
+    const ownerCheckRes = sendTelegramMessage("getChatMember", { chat_id: cid, user_id: uidNum });
+    const ownerCheckData = JSON.parse(ownerCheckRes.getContentText());
+    if (ownerCheckData.ok && ownerCheckData.result && ownerCheckData.result.status === "creator") {
+      reason = "目标是本群群主，Telegram 规则禁止任何机器人对群主执行禁言/踢出/封禁（权限设置无法绕过），需人工处理。";
+      console.error("applyAntispamPenalty 跳过: 目标为群主 chatId=" + cid + " userId=" + uid);
+      return { ok: false, reason: reason };
+    }
+  } catch (e) {
+    // 探测本身失败不阻断主流程，落回下面原有逻辑兜底
   }
 
   try {
