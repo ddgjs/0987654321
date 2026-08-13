@@ -1212,32 +1212,33 @@ function handleMessage(message) {
           try { syncScheduledMessagesStatus(teacherName); } catch (e) {}
           try { notifyTeacherFollowers(teacherName, statusMap[status]); } catch (e) {}
 
-          // 🟢 加速删除：重逻辑结束后，若已接近/超过 10 秒，立刻删提示+触发消息并出队
-          // 多数打卡请求会在这里真正完成“约 10 秒自毁”，队列仅作兜底
+          // 🟢 核心修复：移除长达 8 秒的 Utilities.sleep 阻塞！
+          // 随着老师越来越多，高频打卡触发 sleep 会迅速耗尽 GAS 的 30 个并发线程上限。
+          // 导致后续的新打卡请求直接被 Google 拒收丢包（产生“状态依然是红的，不同步”现象）。
+          // 修复后：若重逻辑执行完后恰好超时，则顺手删除；若未超时，直接结束进程释放性能，交由 delete_queue 定时器异步兜底删除。
           try {
             const remain = expireAt - new Date().getTime();
-            // 剩余 1～12 秒时轻量等待，避免刷榜特别快时提示闪一下就没
-            if (remain > 1000 && remain <= 12000) {
-              Utilities.sleep(Math.min(remain, 8000));
-            }
-            if (message.message_id) {
-              try {
-                sendTelegramMessage("deleteMessage", {
-                  chat_id: String(chatId),
-                  message_id: Number(message.message_id)
-                });
-              } catch (e) {}
-            }
-            if (botMsgId) {
-              try {
-                sendTelegramMessage("deleteMessage", {
-                  chat_id: String(chatId),
-                  message_id: Number(botMsgId)
-                });
-              } catch (e) {}
-            }
-            if (checkinQueueId) {
-              try { writeToFirebase(`delete_queue/${checkinQueueId}`, null); } catch (e) {}
+            
+            if (remain <= 0) {
+              if (message.message_id) {
+                try {
+                  sendTelegramMessage("deleteMessage", {
+                    chat_id: String(chatId),
+                    message_id: Number(message.message_id)
+                  });
+                } catch (e) {}
+              }
+              if (botMsgId) {
+                try {
+                  sendTelegramMessage("deleteMessage", {
+                    chat_id: String(chatId),
+                    message_id: Number(botMsgId)
+                  });
+                } catch (e) {}
+              }
+              if (checkinQueueId) {
+                try { writeToFirebase(`delete_queue/${checkinQueueId}`, null); } catch (e) {}
+              }
             }
           } catch (e) {}
                 } else {
