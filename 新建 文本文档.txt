@@ -335,7 +335,7 @@ function doPost(e) {
          PropertiesService.getUserProperties().deleteProperty('draft_kw_' + uId);
          PropertiesService.getUserProperties().deleteProperty('kw_prompt_msg_id_' + uId);
          const cancelKeyboard = { inline_keyboard: [[{ text: "🔙 取消", callback_data: "CLOSE" }]] };
-         const kwStartRes = sendMessage(update.callback_query.message.chat.id, "🔑 <b>设置关键词回复 (1/4)</b>\n\n请发送您要触发的【关键词】以及【匹配模式】(精准/模糊)。\n\n👉 <b>输入格式：</b>\n<code>关键词 - 精准</code> 或 <code>关键词 - 模糊</code>\n\n示例：\n<code>充值 - 精准</code>\n<code>客服 - 模糊</code>", cancelKeyboard, "HTML");
+         const kwStartRes = sendMessage(update.callback_query.message.chat.id, "🔑 <b>设置关键词回复 (1/4)</b>\n\n请发送您要触发的【关键词】以及【匹配模式】(精准/模糊)。\n\n👉 <b>输入格式：</b>\n<code>关键词 - 精准</code> 或 <code>关键词 - 模糊</code>\n\n示例：\n<code>充值 - 精准</code>\n<code>你好 - 模糊</code>", cancelKeyboard, "HTML");
          try {
            const resData = JSON.parse(kwStartRes.getContentText());
            if (resData.ok) PropertiesService.getUserProperties().setProperty('kw_prompt_msg_id_' + uId, String(resData.result.message_id));
@@ -366,7 +366,7 @@ function doPost(e) {
         PropertiesService.getUserProperties().deleteProperty('menu_prompt_msg_id_' + uId);
         const cancelKeyboard = { inline_keyboard: [[{ text: "🔙 取消", callback_data: "CLOSE" }]] };
         const startRes = sendMessage(update.callback_query.message.chat.id,
-          "⌨️ <b>新增菜单按钮 (1/4)</b>\n\n请发送【按钮显示文字】（将出现在 /menu 底部键盘上）。\n\n可选：在文字后加颜色（空格或 - 分隔）。\n\n颜色样式：\n• <code>primary</code>  🔵 蓝色\n• <code>success</code>  🟢 绿色\n• <code>danger</code>   🔴 红色\n\n示例：\n<code>公开榜</code>\n<code>公开榜 - primary</code>\n<code>联系客服 success</code>",
+          "⌨️ <b>新增菜单按钮 (1/4)</b>\n\n请发送【按钮显示文字】（将出现在 /menu 底部键盘上）。\n\n可选：在文字后加颜色（空格或 - 分隔）。\n\n颜色样式：\n• <code>primary</code>  🔵 蓝色\n• <code>success</code>  🟢 绿色\n• <code>danger</code>   🔴 红色\n\n示例：\n<code>公开榜</code>\n<code>公开榜 - primary</code>\n<code>官方频道 success</code>",
           cancelKeyboard, "HTML");
         // 🟢 记录第一步提示消息 ID，后续步骤自动清理
         try {
@@ -1027,7 +1027,8 @@ const hashtags = text.match(/【老师】\s*[:：]?\s*([^\s,，。、！!？?\n]
 // ================= 处理文本消息 =================
 function handleMessage(message) {
   const chatId = message.chat.id;
-  const text = message.text;
+  // 🟢 核心修复：接收图片/视频时兼容 caption，并回落为空字符串，防止状态机读取 undefined 导致添加图片失败或串车
+  const text = message.text || message.caption || ""; 
   const photo = message.photo;
   const video = message.video;
   const userId = message.from ? message.from.id : chatId;
@@ -1863,8 +1864,11 @@ if (text === '/rebuild_channel') {
         );
         return;
       // 🟢 修复：彻底移除遗留的 MEDIA (评分上传) 状态拦截，并为关键词向导 (KW_) 补充放行条件，防止跳入错乱逻辑
-            } else if ((field.startsWith('LB_') || field.startsWith('WELCOME_') || field.startsWith('STARTMSG_') || field.startsWith('KW_') || field.startsWith('MENU_') || field === 'CHECKIN_KEYWORDS' || field === 'MENU_PROMPT') && !field.startsWith('LB_EDITBTNSONLY_')) {
-        // 🟢 核心修复：拦截发榜向导输入，并严格排除 LB_EDIT_ 防止状态路由冲突导致接收新文案时“没反应”
+            } else if ((field.startsWith('LB_') || field.startsWith('WELCOME_') || field.startsWith('STARTMSG_') || field.startsWith('KW_') || field.startsWith('MENU_') || field === 'CHECKIN_KEYWORDS' || field === 'MENU_PROMPT') && !field.startsWith('LB_EDIT')) {
+        // 🟢 核心修复 v2：原判断 field !== 'LB_EDIT_CONTENT' 永远为 true（代码里从未把 state 设成过这个值），等于没排除任何东西，
+        // 导致 LB_EDITBTNSONLY_ / LB_EDITLOOP_ / LB_EDITSTART_ / LB_EDITEND_ / LB_EDITBOTH_ / LB_EDITBTNS_ / LB_EDIT_ 这些编辑态
+        // 全部先被这个大 block 截胡吞掉（走进来后没有任何分支匹配，只会静默 return），永远到不了它们下面各自对应的 else if 处理逻辑，
+        // 这才是"仅编辑内联按钮无反应"和"修改循环时间无法使用"的真正原因。现在改成排除所有 LB_EDIT 开头的状态，让它们放行到下面。
         const lbDraftStr = PropertiesService.getUserProperties().getProperty('draft_lb_' + userId);
         let lbDraft = lbDraftStr ? JSON.parse(lbDraftStr) : {};
         const cancelKeyboard = { inline_keyboard: [[{ text: "🔙 取消并返回", callback_data: "SETTINGS_MAIN" }]] };
@@ -2781,7 +2785,10 @@ if (text === '/rebuild_channel') {
             // 🟢 写入纠正后的配置，后续发送/同步都用干净数据
             lbDraft.buttonsRaw = correctedRows.join('\n');
           }
-          PropertiesService.getUserProperties().setProperty('state_' + userId, 'WAITING_FOR_LB_TIME');
+          // ✅ 🟢 核心修复：必须将更新后的草稿重新存入属性缓存中，否则下一步保存时新按钮会全部丢失！
+PropertiesService.getUserProperties().setProperty('draft_lb_' + userId, JSON.stringify(lbDraft));
+
+PropertiesService.getUserProperties().setProperty('state_' + userId, 'WAITING_FOR_LB_TIME');
           
           // 🟢 自动删除管理员发送的按钮配置消息及机器人的上一步提示
           try { sendTelegramMessage("deleteMessage", { chat_id: chatId, message_id: message.message_id }); } catch(e) {}
@@ -3409,7 +3416,10 @@ if (text === '/rebuild_channel') {
                        else if (tData.status === 'leave') sText = "🟡休息";
                        btnText += ` [${sText}]`;
                     }
-                    btnRow.push({ text: btnText, url: urlObj });
+                    // 🟢 修复：把解析出的 styleObj 写回按钮对象，否则颜色会在"仅编辑文字内容"同步时丢失
+                    let btnDef = { text: btnText, url: urlObj };
+                    if (styleObj) btnDef.style = styleObj;
+                    btnRow.push(btnDef);
                   }
                 });
                 if (btnRow.length > 0) keyboard.push(btnRow);
@@ -3791,213 +3801,6 @@ if (text === '/rebuild_channel') {
         // 2. 🟢 新增分页：调用分页展示函数（首次进入第 0 页）
         sendSearchReviewList(chatId, userId, null, 0, cleanText);
         return; // 阻止代码继续往下走
-
-      } else if (field === 'SEARCH_TEACHER') {
-        // 🟢 拦截搜索关键词的状态
-        if (!text) {
-          sendMessage(chatId, "⚠️ 请发送纯文本关键词！");
-          return;
-        }
-        
-        // 1. 清除用户的等待输入状态
-        PropertiesService.getUserProperties().deleteProperty('state_' + userId);
-        
-        // 2. 提示用户正在搜索
-        sendMessage(chatId, `🔍 正在为您搜索频道内的老师资料：【${text}】...\n请稍候片刻。`);
-        
-        // 3. 对接 Firebase 查询逻辑 (遍历自动收录的 teachers 索引表)
-        const teachersIndex = readFromFirebase('teachers');
-        let foundResults = [];
-        let exactMatch = null;
-        
-        if (teachersIndex) {
-          // 🟢 核心修复：第一优先进行精确名字匹配，解决“搜索归零2却跳出归零”的同名串车问题
-          for (let teacherName in teachersIndex) {
-            if (teacherName === text) {
-              exactMatch = teacherName;
-              break;
-            }
-          }
-          
-          if (exactMatch) {
-            // 找到一字不差的老师，仅返回该结果，屏蔽杂乱关联
-            foundResults.push({
-              name: exactMatch,
-              message_id: teachersIndex[exactMatch].message_id,
-              channel_id: teachersIndex[exactMatch].channel_id || PUBLISH_CHANNEL_ID
-            });
-          } else {
-            // 没有精确匹配时，再降级使用模糊搜索
-            for (let teacherName in teachersIndex) {
-              if (teacherName.includes(text) || text.includes(teacherName)) {
-                foundResults.push({
-                  name: teacherName,
-                  message_id: teachersIndex[teacherName].message_id,
-                  channel_id: teachersIndex[teacherName].channel_id || PUBLISH_CHANNEL_ID
-                });
-              }
-            }
-          }
-        }
-        
-        // 4. 核心修复：先批量预验证所有匹配帖子是否仍在频道内存在，过滤掉已删除的，再展示给用户
-        if (foundResults.length > 0) {
-          // 🟢 批量预检：用 editMessageReplyMarkup 探针一次性并发验证所有匹配结果
-          //    帖子存在 → ok:true；帖子已被删除 → ok:false + "message not found"
-          const preCheckBatch = foundResults.map(r => ({
-            url: TG_API_URL + 'editMessageReplyMarkup',
-            method: 'post',
-            contentType: 'application/json',
-            payload: JSON.stringify({
-              chat_id: r.channel_id || PUBLISH_CHANNEL_ID,
-              message_id: r.message_id,
-              reply_markup: { inline_keyboard: [] }
-            }),
-            muteHttpExceptions: true
-          }));
-
-          let preCheckResults = [];
-          try {
-            preCheckResults = UrlFetchApp.fetchAll(preCheckBatch);
-          } catch (e) {}
-
-          let deletedNames = [];
-          let verifiedResults = [];
-          foundResults.forEach((r, idx) => {
-            let isDeleted = false;
-            // 修复后
-            if (preCheckResults[idx]) {
-              try {
-                const d = JSON.parse(preCheckResults[idx].getContentText());
-                const desc = (d.description || "").toLowerCase();
-                // 🟢 核心修复：精准拦截频道炸了的报错，防止数据被团灭
-                const isChatDead = desc.includes('chat not found') || desc.includes('kicked') || desc.includes('deactivated') || desc.includes('not a member');
-                isDeleted = !d.ok && !isChatDead && desc && (
-                  desc.includes('message to edit not found') || 
-                  desc.includes('message not found') || 
-                  desc.includes('deleted')
-                );
-              } catch (e) {}
-            }
-            if (isDeleted) {
-              deletedNames.push(r.name);
-            } else {
-              verifiedResults.push(r);
-            }
-          });
-
-          // 🟢 预检发现的已删帖子立即从 Firebase 清理，实现数据库与频道的即时同步
-          if (deletedNames.length > 0) {
-            deletedNames.forEach(name => deleteTeacherAndAssociatedData(name));
-            refreshAllTeacherStatusBoards();
-          }
-
-          // 如果预验证后已无有效结果，直接告知用户，不再走任何加载流程
-          if (verifiedResults.length === 0) {
-            sendMessage(chatId, `❌ 频道内未找到与【${text}】相关的有效资料。\n该老师资料原帖已被管理员从频道删除，相关记录已自动清理缓存。`);
-            return;
-          }
-
-          // 有有效结果才进入以下展示流程（全部来自已验证的 verifiedResults）
-          const maxDisplay = 5;
-          // 🟢 核心新增：在发送资料前，先调用接口查验当前用户是否已经关注了目标频道
-          let isMember = false;
-          try {
-            const memberRes = sendTelegramMessage("getChatMember", { chat_id: PUBLISH_CHANNEL_ID, user_id: chatId });
-            const memberStatus = JSON.parse(memberRes.getContentText()).result.status;
-            if (['creator', 'administrator', 'member'].includes(memberStatus)) {
-              isMember = true;
-            }
-          } catch (e) {
-            isMember = true;
-          }
-          
-          let summaryMsgRes = sendMessage(chatId, `⏳ 正在从资料库提取相关资料，请稍候...`);
-          let summaryMsgId = null;
-          try {
-            summaryMsgId = JSON.parse(summaryMsgRes.getContentText()).result.message_id;
-          } catch(e) {}
-
-          let successCount = 0;
-          let failCount = 0;
-          for (let i = 0; i < verifiedResults.length; i++) {
-            if (successCount >= maxDisplay) break;
-
-            const res = verifiedResults[i];
-            // 🟢 核心修复：使用帖子专属的频道 ID 进行跳转和数据拉取验证
-            const targetChId = res.channel_id || PUBLISH_CHANNEL_ID;
-            const cleanChannelId = String(targetChId).replace('-100', '');
-            const channelLink = `https://t.me/c/${cleanChannelId}/${res.message_id}`;
-
-            let inlineBtn = [];
-            if (isMember) {
-              inlineBtn = [{ text: "🔗 点击跳转到频道相应资料页面", url: channelLink }];
-            } else {
-              inlineBtn = [{ text: "🔒 点击跳转到频道相应资料页面 (需关注)", callback_data: "alert_not_member" }];
-            }
-
-            const payload = {
-              chat_id: chatId,
-              from_chat_id: targetChId, // 🟢 核心修复：从真实的所属频道拉取消息，防止找不到导致误删缓存
-              message_id: res.message_id,
-              reply_markup: JSON.stringify({
-                inline_keyboard: [inlineBtn]
-              })
-            };
-            
-            // 尝试克隆频道消息给用户（经预验证后基本都会成功）
-            const copyRes = sendTelegramMessage("copyMessage", payload);
-            let isOk = false;
-            try {
-              isOk = JSON.parse(copyRes.getContentText()).ok;
-            } catch(e) {}
-
-            if (isOk) {
-              successCount++;
-            } else {
-              // 🟢 核心修复：移除致命的“二次保险”自动删库逻辑。
-              // 防止频道被封禁时 copyMessage 失败导致整个数据库被错误清空！
-              Logger.log(`⚠️ 转发失败，跳过展示，保留数据库记录：${res.name}`);
-              failCount++;
-            }
-          }
-
-          // 🟢 核心新增：如果搜索时发现有失效的帖子被清理，立刻全网刷新在岗榜，让群里的废弃按钮时时消失
-          if (failCount > 0) {
-            refreshAllTeacherStatusBoards();
-          }
-
-          // 提取完成后，修改最初的那条占位提示，汇报真实的有效数量
-          if (successCount > 0) {
-            let actualValidTotal = verifiedResults.length - failCount;
-            let finalSummary = `✅ 实际为您加载了 ${successCount} 条有效资料`;
-            
-            if (actualValidTotal > maxDisplay) {
-              finalSummary += `\n（结果较多，为避免刷屏仅展示前 ${maxDisplay} 条。建议尝试输入更精确的关键词）`;
-            } else {
-              finalSummary += `：`;
-            }
-
-            if (summaryMsgId) {
-              editMessageText(chatId, summaryMsgId, finalSummary, null);
-            } else {
-              sendMessage(chatId, finalSummary);
-            }
-          } else {
-            // 二次保险分支：正常情况不应到达此处
-            let errorMsg = `❌ 抱歉，与【${text}】相关的资料原帖均已失效，已自动清理缓存。`;
-            if (summaryMsgId) {
-              editMessageText(chatId, summaryMsgId, errorMsg, null);
-            } else {
-              sendMessage(chatId, errorMsg);
-            }
-          }
-        } else {
-          sendMessage(chatId, `❌ 频道内未找到与【${text}】相关的资料。\n请尝试更换其他关键词，或确认管理员是否已在频道内发布。`);
-        }
-        
-        return;// ⚠️ 这里必须 return，阻止代码继续往下走弹出车评填写菜单
-        
       } else if (field === 'FEEDBACK') {
         // 🟢 新增：接收用户反馈内容并发送给管理员
         if (!text) {
@@ -9298,52 +9101,6 @@ function moveTeacherToTierChannel(teacherName, teacherData, newTier) {
     Logger.log(`📊 老师 [${teacherName}] 已迁移至 ${newTier} 级频道 (新 msg_id: ${newMsgId})`);
   } catch(e) {
     Logger.log('moveTeacherToTierChannel 异常: ' + e);
-  }
-}
-
-/**
- * 降级检查：由 cleanupDeletedTeachers 定时调用（每小时执行一次）
- * 规则：A或B频道超过30天无新车评 → 自动降一级
- */
-function checkAndDowngradeTeacherTiers() {
-  if (!TIER_CHANNELS.A && !TIER_CHANNELS.B && !TIER_CHANNELS.C) return; // 未配置分级频道则跳过
-
-  // 🟢 速率限制：每小时最多执行一次，避免每分钟重复扫描所有老师
-  const props = PropertiesService.getScriptProperties();
-  const lastCheck = parseInt(props.getProperty('last_tier_downgrade_check')) || 0;
-  const now = new Date().getTime();
-  if (now - lastCheck < 60 * 60 * 1000) return; // 未满1小时，跳过
-  props.setProperty('last_tier_downgrade_check', String(now));
-
-  const allTeachers = readFromFirebase('teachers') || {};
-  const ONE_MONTH = 30 * 24 * 60 * 60 * 1000; // 30天毫秒数
-
-  for (let name in allTeachers) {
-    const t = allTeachers[name];
-    // 只处理已分级（A或B）且有帖子的老师
-    if (!t.message_id || !t.channel_tier || t.channel_tier === 'C') continue;
-
-    const lastReview = t.tier_last_review_at || t.added_at || 0;
-    if ((now - lastReview) <= ONE_MONTH) continue; // 30天内有车评，不降级
-
-    const currentTier = t.channel_tier;
-        let newTier = null;
-        
-        // 🟢 核心修改：A或B频道 30天内无新车评 → 自动直接降至 C频道
-        if ((currentTier === 'A' || currentTier === 'B') && TIER_CHANNELS.C) {
-          newTier = 'C';
-        } else if (currentTier === 'A' && TIER_CHANNELS.B && !TIER_CHANNELS.C) {
-          // 兜底兼容：如果管理员没配置C频道，但配置了B频道，则A频道降级到B频道
-          newTier = 'B';
-        }
-
-        if (newTier) {
-          const latestData = readFromFirebase(`teachers/${name}`);
-          if (latestData) {
-            moveTeacherToTierChannel(name, latestData, newTier);
-            Logger.log(`📉 老师 [${name}] 超30天无车评，从 ${currentTier} 直接降至 ${newTier} 级`);
-          }
-        }
   }
 }
 
